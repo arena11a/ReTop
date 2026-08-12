@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retop-hmn"
+version = "0.1.0"
+description = "Helix Memory Network — reversible coupling + MoE + episodic memory language model (CPU-trainable)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.0",
+    "tokenizers>=0.13",
+]
+
+[project.scripts]
+retop-infer = "infer:main"
+
+[tool.setuptools]
+packages = ["hmn"]
+py-modules = ["infer"]

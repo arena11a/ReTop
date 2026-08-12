@@ -222,7 +222,9 @@ def main():
     ap.add_argument("--train", default=10000, type=int, help="train samples per stage")
     ap.add_argument("--val", default=1000, type=int, help="distinct val keys held out per stage")
     ap.add_argument("--seed", default=42, type=int)
-    ap.add_argument("--outdir", default="/home/yonoob/projects/ReTop/hmn_data/arithmetic")
+    ap.add_argument("--outdir",
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "hmn_data", "arithmetic"))
     ap.add_argument("--chunk", default=10000, type=int)
     args = ap.parse_args()
 

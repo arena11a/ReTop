@@ -16,11 +16,12 @@ import argparse, ast, json, os, random, subprocess, sys, time
 import torch
 import torch.nn as nn
 from tokenizers import Tokenizer
-from hmn_v2 import HMN
+from hmn import HMN
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
 VOCAB_SIZE = 3190
-TOKENIZER_PATH = "/home/yonoob/projects/ReTop/retop_tokenizer.json"
-DATA_ROOT = "/home/yonoob/projects/ReTop/hmn_data/distill_templates"
+TOKENIZER_PATH = os.path.join(ROOT, "retop_tokenizer.json")
+DATA_ROOT = os.path.join(ROOT, "hmn_data", "distill_templates")
 
 
 def build_tokenizer():
@@ -165,6 +166,7 @@ def answer_loss(model, tok, split="train", n=15, seed=0):
 
 
 def main():
+    global TOKENIZER_PATH, DATA_ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", default=1200, type=int)
     ap.add_argument("--dim", default=64, type=int)
@@ -179,10 +181,13 @@ def main():
     ap.add_argument("--save", default=None,
                     help="checkpoint path (best-val-loss model is written here)")
     ap.add_argument("--seed", default=0, type=int)
+    ap.add_argument("--tok", default=TOKENIZER_PATH)
+    ap.add_argument("--data", default=DATA_ROOT)
     ap.add_argument("--standard", action="store_true",
                     help="A/B: train plain LM objective (no distillation framing)")
     args = ap.parse_args()
 
+    TOKENIZER_PATH, DATA_ROOT = args.tok, args.data
     torch.manual_seed(args.seed)
     tok = build_tokenizer()
     model = HMN(VOCAB_SIZE, args.dim, args.state, args.layers, n_experts=16, top_k=2,

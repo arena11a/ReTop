@@ -9,23 +9,24 @@ Usage:
 """
 
 import argparse
+import itertools
 import json
 import os
-import sys
+import random
 import time
 
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_arithmetic import iter_records
-from hmn_v2 import HMN
-
 from tokenizers import Tokenizer
 
+from gen_arithmetic import iter_records
+from hmn import HMN
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
 VOCAB_SIZE = 3190
-TOKENIZER_PATH = "/home/yonoob/projects/ReTop/retop_tokenizer.json"
-DATA_ROOT = "/home/yonoob/projects/ReTop/hmn_data/arithmetic"
+DEFAULT_TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
+DEFAULT_DATA = os.path.join(ROOT, "hmn_data", "arithmetic")
 
 
 def build_tokenizer():
@@ -57,7 +58,7 @@ class StreamingDataset:
         self.batch_size = batch_size
         self.gen = iter_records(self.dir)
         self.buffer = []
-        self.rng = __import__("random").Random(seed)
+        self.rng = random.Random(seed)
 
     def __iter__(self):
         return self
@@ -96,7 +97,7 @@ def eval_accuracy(model, tok, stage, split, n=200, seed=0):
     measure exact-answer accuracy. Streaming, no full load."""
     model.eval()
     import random
-    recs = list(__import__("itertools").islice(iter_records(
+    recs = list(itertools.islice(iter_records(
         os.path.join(DATA_ROOT, f"stage{stage}", split)), n * 5))
     random.Random(seed).shuffle(recs)
     recs = recs[:n]
@@ -128,8 +129,12 @@ def main():
     ap.add_argument("--lr", default=3e-4, type=float)
     ap.add_argument("--eval-every", default=100, type=int)
     ap.add_argument("--seed", default=0, type=int)
+    ap.add_argument("--tok", default=DEFAULT_TOKENIZER)
+    ap.add_argument("--data", default=DEFAULT_DATA)
     args = ap.parse_args()
 
+    global TOKENIZER_PATH, DATA_ROOT
+    TOKENIZER_PATH, DATA_ROOT = args.tok, args.data
     torch.manual_seed(args.seed)
     tok = build_tokenizer()
     model = HMN(VOCAB_SIZE, args.dim, args.state, args.layers, n_experts=16, top_k=2,
@@ -173,7 +178,7 @@ def main():
     # final sample generations
     model.eval()
     with torch.no_grad():
-        for rec in list(__import__("itertools").islice(iter_records(
+        for rec in list(itertools.islice(iter_records(
                 os.path.join(DATA_ROOT, f"stage{args.stage}", "val")), 5)):
             problem = rec["messages"][0]["content"]
             answer = rec["messages"][1]["content"]

@@ -47,11 +47,12 @@ def load_kb_into_memory(memory, embed, tok, freeze=True):
 
 
 if __name__ == "__main__":
-    import sys, torch
-    sys.path.insert(0, "/home/yonoob/projects/ReTop")
+    import os, sys, torch
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from tokenizers import Tokenizer
-    from hmn_v2 import HMN
-    tok = Tokenizer.from_file("/home/yonoob/projects/ReTop/retop_tokenizer.json")
+    from hmn import HMN
+    tok = Tokenizer.from_file(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "retop_tokenizer.json"))
     m = HMN(3190, dim=64, state_dim=8, n_layers=2, n_mem_cells=256)
     n = load_kb_into_memory(m.memory, m.embed, tok, freeze=False)
     # sanity: query each KB key, check the closest cell is itself

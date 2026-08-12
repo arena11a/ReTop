@@ -399,7 +399,9 @@ def write_chunked(out_dir, records, chunk_size=500):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/home/yonoob/projects/ReTop/hmn_data/distill_python")
+    ap.add_argument("--out",
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "hmn_data", "distill_python"))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--val-frac", type=float, default=0.2)
     args = ap.parse_args()

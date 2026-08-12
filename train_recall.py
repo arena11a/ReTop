@@ -17,13 +17,18 @@ import time
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_recall import iter_records
-from hmn_v2 import HMN
-from train_arithmetic import build_tokenizer
+from hmn import HMN
 
-TOKENIZER_PATH = "/home/yonoob/projects/ReTop/retop_tokenizer.json"
-DATA_ROOT = "/home/yonoob/projects/ReTop/hmn_data/recall"
+from tokenizers import Tokenizer
+
+
+def build_tokenizer():
+    return Tokenizer.from_file(TOKENIZER_PATH)
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+TOKENIZER_PATH = os.path.join(ROOT, "retop_tokenizer.json")
+DATA_ROOT = os.path.join(ROOT, "hmn_data", "recall")
 VOCAB_SIZE = 3190
 EOS_ID = 1
 PAD_ID = 3
@@ -132,6 +137,7 @@ def eval_recall(model, tok, n=300, seed=1):
 
 
 def main():
+    global TOKENIZER_PATH, DATA_ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", default=1500, type=int)
     ap.add_argument("--dim", default=64, type=int)
@@ -142,8 +148,11 @@ def main():
     ap.add_argument("--lr", default=3e-4, type=float)
     ap.add_argument("--eval-every", default=300, type=int)
     ap.add_argument("--seed", default=0, type=int)
+    ap.add_argument("--tok", default=TOKENIZER_PATH)
+    ap.add_argument("--data", default=DATA_ROOT)
     args = ap.parse_args()
 
+    TOKENIZER_PATH, DATA_ROOT = args.tok, args.data
     torch.manual_seed(args.seed)
     tok = build_tokenizer()
     model = HMN(VOCAB_SIZE, args.dim, args.state, args.layers, n_experts=16, top_k=2,

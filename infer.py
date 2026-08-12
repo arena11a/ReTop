@@ -1,0 +1,136 @@
+"""Inference for HMN checkpoints: load a trained model + tokenizer and generate.
+
+Works for all architectures (v2 HMN, HMN_Option1, v3 HMN3) from the same CLI.
+Checkpoint must come from a training script that saves `model.state_dict()` and
+must be invoked with the SAME architecture hyperparameters used at train time.
+
+Usage:
+  # one-shot
+  python infer.py --checkpoint ckpt.pt --prompt "pip install numpy"
+  # interactive REPL
+  python infer.py --checkpoint ckpt.pt --interactive --max-new 64
+  # different architecture / config
+  python infer.py --checkpoint v3.pt --arch v3 --dim 96 --layers 3 --gate-bias -2.0
+"""
+import argparse
+import os
+import random
+
+import torch
+
+from tokenizers import Tokenizer
+
+from hmn import HMN, HMN_Option1, HMN3
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+VOCAB = 3190
+EOS = "</s>"
+ASI = "<|assistant|>"
+
+
+def build_tokenizer(path):
+    return Tokenizer.from_file(path)
+
+
+def build_model(arch, args):
+    if arch == "v2":
+        return HMN(VOCAB, args.dim, args.state, args.layers,
+                   n_experts=16, top_k=2,
+                   n_mem_cells=args.mem_cells, mem_top_k=4,
+                   memory_interval=args.mem_interval)
+    if arch == "option1":
+        return HMN_Option1(VOCAB, dim=args.dim, state_dim=args.state,
+                           n_layers=args.layers, n_mem_cells=args.mem_cells,
+                           mem_top_k=4, beta_init=30.0, usage_decay=True,
+                           combined=args.combined, exempt_combined=args.exempt_combined,
+                           n_pairs=args.n_pairs, tie_weights=True)
+    if arch == "v3":
+        return HMN3(VOCAB, dim=args.dim, state_dim=args.state, n_layers=args.layers,
+                    use_moe=args.moe, gate_bias=args.gate_bias,
+                    use_think=args.think, k_max=args.k_max,
+                    asi_id=asi_token_id(args))
+    raise ValueError(f"unknown --arch {arch!r}")
+
+
+def asi_token_id(args):
+    tok = build_tokenizer(args.tok)
+    ids = tok.encode(ASI).ids
+    return ids[0]
+
+
+def encode_chat(tok, user):
+    return tok.encode(f"<s><|user|>{user}<|assistant|>").ids
+
+
+def generate(model, tok, prompt_ids, max_new, seed=0):
+    ids = list(prompt_ids)
+    rng = random.Random(seed)
+    eos = tok.token_to_id(EOS)
+    with torch.no_grad():
+        for _ in range(max_new):
+            inp = torch.tensor([ids])
+            out = model(inp)
+            logits = out if isinstance(out, torch.Tensor) else out["logits"]
+            nxt = logits[0, -1].argmax(-1).item()
+            if nxt == eos:
+                break
+            ids.append(nxt)
+    return tok.decode(ids[len(prompt_ids):])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--checkpoint", required=True, help=".pt state_dict to load")
+    ap.add_argument("--arch", default="v2", choices=["v2", "option1", "v3"])
+    ap.add_argument("--tok", default=os.path.join(ROOT, "retop_tokenizer.json"))
+    ap.add_argument("--dim", type=int, default=64)
+    ap.add_argument("--state", type=int, default=8)
+    ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--mem-cells", type=int, default=8)
+    ap.add_argument("--mem-interval", type=int, default=2)
+    ap.add_argument("--combined", action="store_true")
+    ap.add_argument("--exempt-combined", action="store_true")
+    ap.add_argument("--n-pairs", type=int, default=None)
+    ap.add_argument("--moe", action="store_true")
+    ap.add_argument("--gate-bias", type=float, default=0.0)
+    ap.add_argument("--think", action="store_true")
+    ap.add_argument("--k-max", type=int, default=4)
+    ap.add_argument("--prompt", default=None, help="one-shot prompt")
+    ap.add_argument("--interactive", action="store_true", help="REPL loop")
+    ap.add_argument("--max-new", type=int, default=64)
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    tok = build_tokenizer(args.tok)
+    model = build_model(args.arch, args)
+    try:
+        model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+    except RuntimeError as e:
+        raise SystemExit(
+            f"checkpoint does not match --arch {args.arch} config "
+            f"(dim={args.dim}, layers={args.layers}, ...). "
+            f"Retrain/load with the same hyperparameters used at train time.\n{e}") from e
+    model.eval()
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"loaded {args.arch} ({n_params:,} params) from {args.checkpoint}", flush=True)
+
+    if args.interactive:
+        while True:
+            try:
+                user = input(">>> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not user:
+                continue
+            print(generate(model, tok, encode_chat(tok, user), args.max_new, args.seed))
+    elif args.prompt:
+        print(generate(model, tok, encode_chat(tok, args.prompt), args.max_new, args.seed))
+    else:
+        ap.error("need --prompt or --interactive")
+
+
+if __name__ == "__main__":
+    main()
