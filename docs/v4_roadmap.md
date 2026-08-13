@@ -100,7 +100,8 @@ Not chased early. Comes after smart.
 | M3 | Multi-template | curriculum batch | `recipe.py`, `train_v3.py`, `gen_slots.py` | **PARTIAL**: trained templates -> 4/4 at 1.000 (import/run/apt went 0/40 -> 40/40); never-seen probes still 0.000 -> M2 relative gate is REQUIRED, confirmed |
 | M2 | Relative gate | learned gate w/ gen_margin | `hmn/v3.py` | structure DONE; **finding**: gate learns & doesn't collapse (0.4-0.78 vs v3.1's 0.05) but row-0 subword off-by-one is the real unseen-template blocker -> M3b (see §6) |
 | M3b | _new_ Template pooling | train on many verbs, probe held-out verbs | `train_v3.py` | 10 trained verbs -> all 1.000; held-out verb (mount/uninstall/clean/check) still 0.000 at gate 0.001 |
-| M4 | Think D1 | wire + validate on multi-step | `retop.py`, `train_v3.py`, `gen_chat.py` | thinking > no-thinking on multi-step |
+| M4 | Think D1 | wire + validate on multi-step | `hmn/v3.py`, `recipe.py`, `train_v3.py` | **DONE**: new 2-slot chain task (disjoint pkg/lib families); think 0.925 vs no-think 0.900 (300+500 steps, stable); think also halves fails 13->6/60 and removes the empty-output gate-collapse class -> thinking wins on multi-step. Residual: EOS-loop at g~0.96 both modes (decode-level, not think) |
+| M4b | _new_ | EOS reliability on chain task | `recipe.py` (decode/boundary) | chain task both modes plateau gen~18/24, gate stays ~0.96 at end -> boundary rule needs a post-segment trigger (think not responsible) |
 | M5 | GPU spec | silver/gold + MoE@large | `retop.py` | val good, no crash |
 | M6 | Think D2 | latent-slot (if M4 wins) | `hmn/v3.py`, `recipe.py` | beats D1 |
 | M7 | GUI v4 | toggles + v4 verify matrix | `retop_gui.py` | think/spec toggle usable |
@@ -167,3 +168,15 @@ added from external review feedback.
   template-start distribution that is open-vocabulary. Both are M2-dev follow-
   ups; the immediate lever already measured is verb pooling helping every
   SEEN verb but none held out (template-bound copy persists).
+- **M4 finding (2026-08-13)**: thinking helps the 2-slot chain task ONLY after
+  the two slot families have DISJOINT token id sets. The original
+  pkgA/pkgB pairing shared 'p','k','g' + digit subtokens, so the second copy
+  chain was a 50% coin-flip *before* any thinking could matter (both modes
+  stuck at 0.000). With pkg/lib disjoint families the task separates: think
+  0.925 vs no-think 0.900, and think eliminates the no-think empty-output
+  failures (gate collapsed to 0.001 at row 0 -> ''). Remaining shared failure:
+  EOS-loop — the gate stays ~0.96 after the final token because "and deploy
+  lib012" leaves the same-token-id mass intact, so neither mode emits EOS
+  inside max_new (decode-plumbing, M4b). Takeaway: multi-step is a REGISTER-
+  ADDRESSING problem first; thinking amplifies what the register can already
+  bind.

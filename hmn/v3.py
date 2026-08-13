@@ -284,6 +284,12 @@ class LatentThinkingBuffer(nn.Module):
         self.k_max = k_max
         self.thr = thr
         self.adapt = nn.Linear(dim, dim)
+        # v4 M4: init adapt as ~identity so at init think is roughly a no-op
+        # (the +adapt residual barely shifts h). Keeps the think on/off
+        # ablation honest: whatever M4 measures comes from training, not from
+        # an arbitrary random hop.
+        nn.init.zeros_(self.adapt.weight)
+        nn.init.zeros_(self.adapt.bias)
 
     def forward(self, h, block_fn):
         prev_conf = None

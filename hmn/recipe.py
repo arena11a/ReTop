@@ -35,6 +35,19 @@ SPECIAL_TOKENS = [BOS, EOS, UNK, PAD, USER, ASSIST]
 
 # default chat-template used by make_chat_ids / decode (override via args)
 DEFAULT_TEMPLATE = "pip install {slot}"
+# v4 M4 multi-step task: the answer runs TWO distinct copy chains in sequence
+# ("fetch pkg028 and deploy lib055"). slot A and slot B are drawn from
+# DIFFERENT families (pkg-prefix vs lib-prefix, disjoint digit ranges) so
+# their token ids never collide — the identity register can then bind each
+# segment unambiguously (the original pkgA/pkgB variant shared 'p','k','g'/digit
+# subtokens, making the second chain a coin-flip at 50%). The register must
+# re-seed mid-answer on "and deploy": the multi-step property.
+CHAIN_A_TEMPLATE = "fetch {slot}"
+CHAIN_B_TEMPLATE = "and deploy {slot}"
+CHAIN_SLOTS_A = [f"pkg{i:03d}" for i in range(0, 40)]       # train
+CHAIN_SLOTS_B = [f"lib{i:03d}" for i in range(40, 80)]      # train
+CHAIN_SLOTS_A_U = [f"pkg{i:03d}" for i in range(60, 100)]   # eval unseen
+CHAIN_SLOTS_B_U = [f"lib{i:03d}" for i in range(0, 40)]     # eval unseen
 
 
 def make_chat_ids(tok, user, gold=None):
@@ -126,6 +139,64 @@ def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
         YcB[j, :len(YC[j])] = torch.tensor(YC[j])
         Gb[j, :len(G[j])] = torch.tensor(G[j])
     return Xb, Yb, YcB, Gb
+
+
+def make_slot_chain_batch(tok, bs, seed):
+    """v4 M4 multi-step batch -> (X, Y, Yc, G).
+
+    user = "fetch {a} and deploy {b}"   (a ∈ pkg-family, b ∈ lib-family)
+    gold = same. a,b re-drawn per record (sampling from the disjoint families)
+    so no fixed pairing is memorizable. Two independent copy chains in ONE
+    answer: the register must chain "fetch pkg028", then RE-SEED on
+    "and deploy lib055" mid-answer. Token sets of a and b are disjoint, so the
+    second chain is addressable — the difficulty is the re-seed itself.
+    """
+    rng = random.Random(seed)
+    eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
+    X, Y, YC, G = [], [], [], []
+    for _ in range(bs):
+        a = rng.choice(CHAIN_SLOTS_A)
+        b = rng.choice(CHAIN_SLOTS_B)
+        user = f"fetch {a} and deploy {b}"
+        gold = user
+        ids = make_chat_ids(tok, user, gold)
+        y, yc, gt = make_chat_targets(ids, asid, eos)
+        X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
+    T = max(len(x) for x in X)
+    Xb = torch.full((bs, T), eos, dtype=torch.long)
+    Yb = torch.full((bs, T), -100, dtype=torch.long)
+    YcB = torch.full((bs, T), -100, dtype=torch.long)
+    Gb = torch.full((bs, T), -1.0, dtype=torch.float)
+    for j in range(bs):
+        Xb[j, :len(X[j])] = torch.tensor(X[j])
+        Yb[j, :len(Y[j])] = torch.tensor(Y[j])
+        YcB[j, :len(YC[j])] = torch.tensor(YC[j])
+        Gb[j, :len(G[j])] = torch.tensor(G[j])
+    return Xb, Yb, YcB, Gb
+
+
+def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
+                     max_new=24, boundary_eos=False):
+    """Exact-match on the two-slot chain task for UNSEEN slot pairs.
+    a drawn from `a_slots`, b from `b_slots` (each record re-sampled).
+    Returns (accuracy, avg_gate, avg_gen_tokens)."""
+    model.eval()
+    rng = random.Random(seed)
+    ok = tot = 0
+    gates, ngen = [], 0
+    for _ in a_slots:
+        a = rng.choice(a_slots)
+        b = rng.choice(b_slots)
+        gold = f"fetch {a} and deploy {b}"
+        prompt = make_chat_ids(tok, gold)
+        out, g, ng = decode_v33(model, tok, prompt, mode=mode, max_new=max_new,
+                                boundary_eos=boundary_eos)
+        tot += 1
+        ok += int(out.strip() == gold)
+        gates.append(g); ngen += ng
+    model.train()
+    return ok / tot, (sum(gates) / len(gates) if gates else 0.0), ngen / max(1, tot)
 
 
 def copy_prob_sparse(attn, nxt, targets):

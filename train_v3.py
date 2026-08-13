@@ -39,7 +39,10 @@ import torch.nn as nn
 from tokenizers import Tokenizer
 
 from hmn import HMN3, HMN3_NoReg
-from hmn.recipe import DEFAULT_TEMPLATE, eval_slots, loss_v33, make_slot_batch, seed_guardrail
+from hmn.recipe import (CHAIN_SLOTS_A, CHAIN_SLOTS_A_U, CHAIN_SLOTS_B,
+                        CHAIN_SLOTS_B_U, DEFAULT_TEMPLATE, eval_slot_chains,
+                        eval_slots, loss_v33, make_slot_batch,
+                        make_slot_chain_batch, seed_guardrail)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOS = "</s>"
@@ -64,7 +67,8 @@ def build_model(arch, args, tok):
     return HMN3(vocab, dim=args.dim, state_dim=8, n_layers=args.layers,
                 use_moe=args.moe, gate_bias=args.gate_bias, asi_id=asi_id(tok),
                 keys_proj=args.keys_proj, aux_copy=(arch == "v31"),
-                sparse_marginal=args.sparse_marginal, gate_mode=args.gate_mode)
+                sparse_marginal=args.sparse_marginal, gate_mode=args.gate_mode,
+                use_think=args.use_think, k_max=args.k_max)
 
 
 def main():
@@ -86,6 +90,14 @@ def main():
     ap.add_argument("--gate-mode", default="deterministic", choices=["deterministic", "relative"],
                     help="v4 M2: deterministic same-token-id gate (default, v3.3-final) or the "
                          "learned RelativeGate ([h, gate_mass, gen_margin, behind, n_legal])")
+    ap.add_argument("--use-think", action="store_true",
+                    help="v4 M4: run LatentThinkingBuffer before the head (k_max re-runs of the "
+                         "WR block stack refining h in latent space)")
+    ap.add_argument("--k-max", type=int, default=4,
+                    help="v4 M4: max latent re-runs for use_think")
+    ap.add_argument("--task", default="slot", choices=["slot", "chain"],
+                    help="v4 M4: slot = single-template copy (default); chain = two-slot "
+                         "multi-step task (fetch {a} and deploy {b})")
     ap.add_argument("--moe", action="store_true")
     ap.add_argument("--keys-proj", action="store_true")
     ap.add_argument("--eval-every", type=int, default=250)
@@ -120,8 +132,11 @@ def main():
     t0 = time.time()
 
     for step in range(1, args.steps + 1):
-        X, Y, Yc, G = make_slot_batch(tok, PKGS_SEEN, args.bs, step,
-                                      templates=tpls)
+        if args.task == "chain":
+            X, Y, Yc, G = make_slot_chain_batch(tok, args.bs, step)
+        else:
+            X, Y, Yc, G = make_slot_batch(tok, PKGS_SEEN, args.bs, step,
+                                          templates=tpls)
         opt.zero_grad()
         out = model(X)
         if args.arch == "v31":
@@ -137,29 +152,46 @@ def main():
 
         if step % args.eval_every == 0 or step == args.steps:
             final = (step == args.steps)
-            s_b, s_g, _ = eval_slots(model, tok, PKGS_SEEN, mode="blend",
-                                     seed=7, boundary_eos=True, template=tpls[0])
-            u_b, u_g, u_ng = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
-                                        seed=9, boundary_eos=True, template=tpls[0])
+            if args.task == "chain":
+                # v4 M4: two-slot chain on UNSEEN slot pairs — the multi-step
+                # eval. seen uses PKGS_SEEN pairings, unseen uses PKGS_UNSEEN.
+                s_b, s_g, _ = eval_slot_chains(model, tok, CHAIN_SLOTS_A, CHAIN_SLOTS_B,
+                                       seed=7, boundary_eos=True)
+                u_b, u_g, u_ng = eval_slot_chains(model, tok, CHAIN_SLOTS_A_U,
+                                                  CHAIN_SLOTS_B_U, seed=9,
+                                                  boundary_eos=True)
+            else:
+                s_b, s_g, _ = eval_slots(model, tok, PKGS_SEEN, mode="blend",
+                                         seed=7, boundary_eos=True, template=tpls[0])
+                u_b, u_g, u_ng = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
+                                            seed=9, boundary_eos=True, template=tpls[0])
             el = time.time() - t0
             line = (f"step {step:5d} loss={loss.item():.3f} "
                     f"seen={s_b:.3f}(g{s_g:.2f}) unseen_blend={u_b:.3f}(g{u_g:.2f},gen{u_ng:.1f})")
             if final:
-                u_h, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="hard",
-                                       seed=9, boundary_eos=True, template=tpls[0])
-                u_c, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="copy", seed=9,
-                                       template=tpls[0])
-                line += f" hard={u_h:.3f} copy={u_c:.3f}"
+                if args.task == "chain":
+                    u_h, _, _ = eval_slot_chains(model, tok, CHAIN_SLOTS_A_U,
+                                                 CHAIN_SLOTS_B_U,
+                                                 seed=9, mode="hard", boundary_eos=True)
+                else:
+                    u_h, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="hard",
+                                           seed=9, boundary_eos=True, template=tpls[0])
+                    u_c, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="copy", seed=9,
+                                           template=tpls[0])
+                    line += f" hard={u_h:.3f} copy={u_c:.3f}"
 
                 # v4 M3: per-template table — all TRAINED templates + NEVER-seen
                 # probe templates. This is the whole point: does the copy gate
                 # generalize once it has seen several templates at train time?
-                print("  v4 M3 per-template (unseen slots, blend+boundary):")
-                for name, tpl in ([(f"trained:{t}", t) for t in tpls]
-                                  + [(f"probe:{p}", p) for p in PROBE_TEMPLATES]):
-                    a, g, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
-                                         seed=9, boundary_eos=True, template=tpl)
-                    print(f"    {name:<16} {a:.3f}  gate={g:.3f}")
+                if args.task != "chain":
+                    print("  v4 M3 per-template (unseen slots, blend+boundary):")
+                    for name, tpl in ([(f"trained:{t}", t) for t in tpls]
+                                      + [(f"probe:{p}", p) for p in PROBE_TEMPLATES]):
+                        a, g, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
+                                             seed=9, boundary_eos=True, template=tpl)
+                        print(f"    {name:<16} {a:.3f}  gate={g:.3f}")
+                else:
+                    line += f" hard={u_h:.3f}"
 
             print(line + f" [{el:.0f}s]", flush=True)
             if u_b > best_unseen:
