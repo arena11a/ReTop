@@ -177,7 +177,7 @@ def make_slot_chain_batch(tok, bs, seed):
 
 
 def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
-                     max_new=24, boundary_eos=False):
+                     max_new=40, boundary_eos=False, cycle_break=False):
     """Exact-match on the two-slot chain task for UNSEEN slot pairs.
     a drawn from `a_slots`, b from `b_slots` (each record re-sampled).
     Returns (accuracy, avg_gate, avg_gen_tokens)."""
@@ -191,7 +191,7 @@ def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
         gold = f"fetch {a} and deploy {b}"
         prompt = make_chat_ids(tok, gold)
         out, g, ng = decode_v33(model, tok, prompt, mode=mode, max_new=max_new,
-                                boundary_eos=boundary_eos)
+                                boundary_eos=boundary_eos, cycle_break=cycle_break)
         tot += 1
         ok += int(out.strip() == gold)
         gates.append(g); ngen += ng
@@ -275,7 +275,7 @@ def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
 
 
 def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
-               boundary_eos=False, device=None):
+               boundary_eos=False, device=None, cycle_break=False):
     """Greedy decode. mode:
       blend  -> argmax of (1-g)*gen + g*copy
       hard   -> if g > gate_thr: argmax(copy_dist) else argmax(blend)
@@ -288,11 +288,20 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
       gen head to discover this per-slot is a lottery (pkg094 'rude' bug, ~1-2
       fails/seed); forcing EOS on a low gate makes the boundary deterministic.
       step 0 (seed=ASI, first answer token) is exempt: len(ids)==len(prompt).
+    cycle_break (v4 M4b): if the same 2-token emission (prev, next) pair
+      occurs twice while decoding, we are replaying an already-emitted
+      segment (the register found a twin again and repeats its payload —
+      e.g. the chain task's " and deploy lib039 and deploy ..." loop after the
+      true end). Force EOS on the repeat. NOTE: a 1-token pair is NOT enough
+      (the chain task legitimately re-emits tokens like '0' across segments);
+      the (prev,next) window is unique per true answer. Deterministic
+      (decoder-time stop rule, not a model change).
     Returns (text, gate_avg, n_gen).
     """
     ids = list(prompt_ids)
     eos = tok.token_to_id(EOS)
     gates, n_gen = [], 0
+    seen_pairs = set()
     with torch.no_grad():
         for _ in range(max_new):
             inp = torch.tensor([ids], device=device)
@@ -301,7 +310,14 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
             g = out["g"][0, -1].item()
             copy = out["copy_dist"][0, -1]
             gates.append(g)
-            if boundary_eos and len(ids) > len(prompt_ids) and g < gate_thr:
+            pair = None
+            if len(ids) > len(prompt_ids) + 1:
+                prev = ids[-1]
+                cand = copy.argmax(-1).item()
+                pair = (prev, cand)
+            if cycle_break and pair is not None and pair in seen_pairs:
+                nxt = eos                          # segment replay -> stop
+            elif boundary_eos and len(ids) > len(prompt_ids) and g < gate_thr:
                 nxt = eos
             elif mode == "copy":
                 nxt = copy.argmax(-1).item()
@@ -310,6 +326,8 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
             else:
                 n_gen += 1
                 nxt = logits[0, -1].argmax(-1).item()
+            if pair is not None:
+                seen_pairs.add(pair)
             if nxt == eos:
                 break
             ids.append(nxt)

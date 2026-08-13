@@ -156,10 +156,10 @@ def main():
                 # v4 M4: two-slot chain on UNSEEN slot pairs — the multi-step
                 # eval. seen uses PKGS_SEEN pairings, unseen uses PKGS_UNSEEN.
                 s_b, s_g, _ = eval_slot_chains(model, tok, CHAIN_SLOTS_A, CHAIN_SLOTS_B,
-                                       seed=7, boundary_eos=True)
+                                       seed=7, boundary_eos=True, cycle_break=True)
                 u_b, u_g, u_ng = eval_slot_chains(model, tok, CHAIN_SLOTS_A_U,
                                                   CHAIN_SLOTS_B_U, seed=9,
-                                                  boundary_eos=True)
+                                                  boundary_eos=True, cycle_break=True)
             else:
                 s_b, s_g, _ = eval_slots(model, tok, PKGS_SEEN, mode="blend",
                                          seed=7, boundary_eos=True, template=tpls[0])
@@ -172,7 +172,8 @@ def main():
                 if args.task == "chain":
                     u_h, _, _ = eval_slot_chains(model, tok, CHAIN_SLOTS_A_U,
                                                  CHAIN_SLOTS_B_U,
-                                                 seed=9, mode="hard", boundary_eos=True)
+                                                 seed=9, mode="hard",
+                                                 boundary_eos=True, cycle_break=True)
                 else:
                     u_h, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="hard",
                                            seed=9, boundary_eos=True, template=tpls[0])

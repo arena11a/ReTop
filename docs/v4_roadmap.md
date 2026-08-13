@@ -101,7 +101,7 @@ Not chased early. Comes after smart.
 | M2 | Relative gate | learned gate w/ gen_margin | `hmn/v3.py` | structure DONE; **finding**: gate learns & doesn't collapse (0.4-0.78 vs v3.1's 0.05) but row-0 subword off-by-one is the real unseen-template blocker -> M3b (see §6) |
 | M3b | _new_ Template pooling | train on many verbs, probe held-out verbs | `train_v3.py` | 10 trained verbs -> all 1.000; held-out verb (mount/uninstall/clean/check) still 0.000 at gate 0.001 |
 | M4 | Think D1 | wire + validate on multi-step | `hmn/v3.py`, `recipe.py`, `train_v3.py` | **DONE**: new 2-slot chain task (disjoint pkg/lib families); think 0.925 vs no-think 0.900 (300+500 steps, stable); think also halves fails 13->6/60 and removes the empty-output gate-collapse class -> thinking wins on multi-step. Residual: EOS-loop at g~0.96 both modes (decode-level, not think) |
-| M4b | _new_ | EOS reliability on chain task | `recipe.py` (decode/boundary) | chain task both modes plateau gen~18/24, gate stays ~0.96 at end -> boundary rule needs a post-segment trigger (think not responsible) |
+| M4b | _new_ | EOS reliability on chain task | `recipe.py` (decode) | **DONE**: cycle guard (2-token window, decoder-time only). no-think 0.900->0.925, think 0.925->0.950; guardrails bit-identical. Residual model-level fails (not decode): `lib0` subtoken truncate + no-think row-0 gate collapse -> M2-dev |
 | M5 | GPU spec | silver/gold + MoE@large | `retop.py` | val good, no crash |
 | M6 | Think D2 | latent-slot (if M4 wins) | `hmn/v3.py`, `recipe.py` | beats D1 |
 | M7 | GUI v4 | toggles + v4 verify matrix | `retop_gui.py` | think/spec toggle usable |
@@ -180,3 +180,12 @@ added from external review feedback.
   inside max_new (decode-plumbing, M4b). Takeaway: multi-step is a REGISTER-
   ADDRESSING problem first; thinking amplifies what the register can already
   bind.
+- **M4b finding (2026-08-13)**: the chain EOS-loop root cause is structural:
+  after the final true token (e.g. '9' of lib039) the seed's twin points at
+  ' and' (start of the template segment) -> copy lane replays ' and deploy
+  lib039' forever; gate stays ~0.997 so the old g<0.5 boundary rule never
+  fires. Player plot: a 1-token (prev,next) cycle detector is a false
+  positive (segments legitimately share tokens like '0'/'9'), but a 2-token
+  window is unique per true answer and breaks the loop deterministically.
+  Residual fails are model-level (lib0 subtoken truncation comes from the
+  same-lookups, no-think row-0 gate collapse), not decoder plumbing.
