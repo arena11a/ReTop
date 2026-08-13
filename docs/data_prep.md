@@ -50,6 +50,33 @@ and `data/slots.jsonl.meta.json`. The `--kind` slot vocabularies:
 > meaningful if the eval slots were never in the training file. Verify your own
 > split the same way: `set(seen) & set(unseen) == ∅`.
 
+## 1b. Distributed chat corpora (`gen_chat.py`) — English & Math
+
+`gen_chat.py` streams combinatorial chat-pairs up to a target token budget
+(~4 chars/token heuristic). Deterministic per `--seed`; the sidecar
+`<out>.meta.json` records `records`, `chars`, and the approx token count.
+
+```bash
+python gen_chat.py --domain english       --target-tokens 10_000_000  --out data/english_10m.jsonl
+python gen_chat.py --domain math_general  --target-tokens 30_000_000  --out data/math_general_30m.jsonl
+python gen_chat.py --domain math_complex  --target-tokens 60_000_000  --out data/math_complex_60m.jsonl
+python gen_chat.py --domain math_advanced --target-tokens 120_000_000 --out data/math_advanced_120m.jsonl
+```
+
+Shipped corpora (do not commit — `data/` is git-ignored):
+
+| file | tokens (approx) | content |
+|---|---|---|
+| `data/english_10m.jsonl` | 10M | general knowledge / trivia / how-to dialogue |
+| `data/english_50m.jsonl` | 50M | same, larger |
+| `data/english_100m.jsonl` | 100M | same, largest |
+| `data/math_general_30m.jsonl` | 30M | arithmetic, distance, sharing, %, rectangles |
+| `data/math_complex_60m.jsonl` | 60M | fractions, ratios, linear equations, triangle area |
+| `data/math_advanced_120m.jsonl` | 120M | powers, sqrt/cuberoot, circles, quadratics, compound % |
+
+Math answers are computed in the generator (no hand-written labels), so the
+corpora are internally consistent. Train with `retop.py train --data <file>`.
+
 ## 2. General chat pairs (.jsonl)
 
 ```json
