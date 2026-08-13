@@ -119,6 +119,23 @@ def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE):
     return Xb, Yb, YcB, Gb
 
 
+def copy_prob_sparse(attn, nxt, targets):
+    """v4 sparse copy-marginal: p_copy(row, t) for target token ids.
+
+    attn    : (B, T, T) position attention over prompt columns
+    nxt     : (B, T) payload token id per column (0 = none)
+    targets : (B, T) target token ids per row (Yc; -100 = ignore row)
+
+    p = sum_j a[t, j] * [nxt[j] == target]  — i.e. attention over exactly the
+    payload columns whose next token IS the target. Identical by construction
+    to dense copy distribution lookup (masked columns carry zero attention),
+    computed without ever materializing the (B, T, V) copy tensor. Ignore rows
+    (target == -100) return 0 and are filtered by the caller.
+    """
+    eq = (nxt.unsqueeze(1) == targets.unsqueeze(-1))            # (B,T,T)
+    return (attn * eq.float()).sum(-1)                          # (B,T)
+
+
 def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0):
     """v3.3 loss = blend CE + w_copy*gen CE (masked) + w_copy*copy CE (manual).
 
@@ -146,13 +163,25 @@ def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0):
     gen_tgt = Y.reshape(-1).clone()
     gen_tgt[G.reshape(-1) != 0.0] = -100     # gen rows only
     l_gen = lossf(out["gen_logits"].reshape(-1, vocab), gen_tgt)
-    probs = out["copy_dist"].reshape(-1, vocab).clamp(min=1e-9)
-    yv = Yc.reshape(-1)
-    if (yv != -100).any():
-        lc = -probs[yv != -100].gather(1, yv[yv != -100].unsqueeze(1)).squeeze(-1).log()
-        l_copy = lc.mean()
+    if "attn" in out and "nxt" in out:
+        # v4 sparse copy-marginal path: NO (B,T,V) copy tensor was built —
+        # p_copy(target) = sum over payload columns j with ids[j+1]==target of a.
+        # This is algebraically identical to dense copy_dist[., target] (the
+        # position-gather carries zero attention for masked columns), so the
+        # loss is bit-equivalent to the dense path without the O(T·V) memory.
+        yv = Yc.reshape(-1)
+        vmask = yv != -100
+        p = copy_prob_sparse(out["attn"], out["nxt"], Yc).reshape(-1)[vmask]
+        lc = -p.clamp(min=1e-9).log()
+        l_copy = lc.mean() if lc.numel() else torch.zeros((), device=out["logits"].device)
     else:
-        l_copy = torch.zeros((), device=out["logits"].device)
+        probs = out["copy_dist"].reshape(-1, vocab).clamp(min=1e-9)
+        yv = Yc.reshape(-1)
+        if (yv != -100).any():
+            lc = -probs[yv != -100].gather(1, yv[yv != -100].unsqueeze(1)).squeeze(-1).log()
+            l_copy = lc.mean()
+        else:
+            l_copy = torch.zeros((), device=out["logits"].device)
     loss = l_blend + w_copy * l_gen + w_copy * l_copy
     return loss, l_blend, l_gen, l_copy
 

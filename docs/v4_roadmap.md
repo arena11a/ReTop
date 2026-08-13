@@ -96,7 +96,7 @@ Not chased early. Comes after smart.
 | Phase | Milestone | Work | Files | Pass criterion |
 |---|---|---|---|---|
 | M0 | Baseline + doc | branch v4, this doc, verify v3.3 | `docs/` | 40/40 + ALL TESTS |
-| M1 | Sparse marginal | IR mass `(B,T,V)->(B,T,V_ct)` | `hmn/v3.py` | v3.3 40/40 unchanged + mem benchmark |
+| M1 | Sparse marginal | IR mass `(B,T,V)->` position-gather; loss reads (attn,nxt) | `hmn/v3.py`, `recipe.py` | **DONE**: parity 0.000e+00, 40/40 kept |
 | M2 | Relative gate | learned gate w/ gen_margin | `hmn/v3.py` | template probes up |
 | M3 | Multi-template | curriculum batch | `recipe.py`, `train_v3.py`, `gen_slots.py` | unseen templates >= 36/40; original still 40/40 |
 | M4 | Think D1 | wire + validate on multi-step | `retop.py`, `train_v3.py`, `gen_chat.py` | thinking > no-thinking on multi-step |
@@ -124,7 +124,16 @@ is the base of the new IR (and shortens context cost as a side effect).
 
 ## 6. Open questions while building
 
+- **M1 finding (2026-08-13)**: the true long-context bottleneck is NOT the
+  `(B,T,V)` copy mass — it is the register attention `sim = qk @ ek.T`
+  (`(B,T,T)`, explodes at T > ~1.5k on 4 GB) AND the dual-head logits
+  `(B,T,V)` (the model output itself). M1 eliminated the copy-path duplicate
+  allocations and made the copy CE read only (attn, nxt); long-context must
+  tackle `(B,T,T)` (chunked/approximate attention) next, and `(B,T,V)` logits
+  are irreducible for a full-vocab head.
 - Whether `V_ct` marginal breaks the `copy_dist` renormalization identity used
-  by `loss_v33` (must re-check the `-log p_target` gather).
+  by `loss_v33` (must re-check the `-log p_target` gather) — resolved: M1 uses
+  the position-gather formulation which is bit-identical, no renormalization
+  drift.
 - MoE gain at high D: enable only if it measurably helps val on GPU.
 - Multi-template curriculum order: fixed order vs temperature-sampled mix.
