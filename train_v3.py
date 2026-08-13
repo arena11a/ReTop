@@ -24,6 +24,10 @@ Usage:
   python train_v3.py --steps 3000 --dim 96 --layers 3
   python train_v3.py --arch baseline ...      # blend CE only (no aux)
   python train_v3.py --arch noreg ...          # no copy channel (softmax only)
+  python train_v3.py --templates "pip install {slot}|import {slot}" ...
+      # v4 M3: multi-template curriculum (per-record random template). When
+      # set, eval reports each template + templates NEVER trained (measured
+      # generalization: does the copy gate stop being lexicon-bound?)
 """
 import argparse
 import os
@@ -59,7 +63,8 @@ def build_model(arch, args, tok):
         return HMN3_NoReg(vocab, dim=args.dim, state_dim=8, n_layers=args.layers)
     return HMN3(vocab, dim=args.dim, state_dim=8, n_layers=args.layers,
                 use_moe=args.moe, gate_bias=args.gate_bias, asi_id=asi_id(tok),
-                keys_proj=args.keys_proj, aux_copy=(arch == "v31"))
+                keys_proj=args.keys_proj, aux_copy=(arch == "v31"),
+                sparse_marginal=args.sparse_marginal)
 
 
 def main():
@@ -81,12 +86,24 @@ def main():
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", default="hmn_v31.pt")
+    ap.add_argument("--templates", default=None,
+                    help="v4 M3: pipe-separated training template list, e.g. "
+                         "'pip install {slot}|import {slot}|run {slot}|apt install {slot}' "
+                         "(default: single DEFAULT_TEMPLATE)")
+    ap.add_argument("--sparse-marginal", action="store_true",
+                    help="v4 M1: use the sparse copy-marginal path (no (B,T,V) copy tensor)")
     args = ap.parse_args()
+
+    tpls = [DEFAULT_TEMPLATE] if not args.templates else args.templates.split("|")
+    PROBE_TEMPLATES = [  # NEVER trained, regardless of --templates — generalizes?
+        "remove {slot}", "delete {slot}", "get {slot}",
+    ]
 
     seed_guardrail(args.seed)
     tok = build_tok()
     model = build_model(args.arch, args, tok)
-    print(f"params: {sum(p.numel() for p in model.parameters()):,} | arch={args.arch}", flush=True)
+    print(f"params: {sum(p.numel() for p in model.parameters()):,} | arch={args.arch} "
+          f"sparse={args.sparse_marginal}", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     lossf = nn.CrossEntropyLoss(ignore_index=-100)
@@ -95,7 +112,7 @@ def main():
 
     for step in range(1, args.steps + 1):
         X, Y, Yc, G = make_slot_batch(tok, PKGS_SEEN, args.bs, step,
-                                      template=DEFAULT_TEMPLATE)
+                                      templates=tpls)
         opt.zero_grad()
         out = model(X)
         if args.arch == "v31":
@@ -111,17 +128,29 @@ def main():
         if step % args.eval_every == 0 or step == args.steps:
             final = (step == args.steps)
             s_b, s_g, _ = eval_slots(model, tok, PKGS_SEEN, mode="blend",
-                                     seed=7, boundary_eos=True)
+                                     seed=7, boundary_eos=True, template=tpls[0])
             u_b, u_g, u_ng = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
-                                        seed=9, boundary_eos=True)
+                                        seed=9, boundary_eos=True, template=tpls[0])
             el = time.time() - t0
             line = (f"step {step:5d} loss={loss.item():.3f} "
                     f"seen={s_b:.3f}(g{s_g:.2f}) unseen_blend={u_b:.3f}(g{u_g:.2f},gen{u_ng:.1f})")
             if final:
                 u_h, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="hard",
-                                       seed=9, boundary_eos=True)
-                u_c, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="copy", seed=9)
+                                       seed=9, boundary_eos=True, template=tpls[0])
+                u_c, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="copy", seed=9,
+                                       template=tpls[0])
                 line += f" hard={u_h:.3f} copy={u_c:.3f}"
+
+                # v4 M3: per-template table — all TRAINED templates + NEVER-seen
+                # probe templates. This is the whole point: does the copy gate
+                # generalize once it has seen several templates at train time?
+                print("  v4 M3 per-template (unseen slots, blend+boundary):")
+                for name, tpl in ([(f"trained:{t}", t) for t in tpls]
+                                  + [(f"probe:{p}", p) for p in PROBE_TEMPLATES]):
+                    a, g, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
+                                         seed=9, boundary_eos=True, template=tpl)
+                    print(f"    {name:<16} {a:.3f}  gate={g:.3f}")
+
             print(line + f" [{el:.0f}s]", flush=True)
             if u_b > best_unseen:
                 best_unseen = u_b

@@ -97,17 +97,34 @@ Not chased early. Comes after smart.
 |---|---|---|---|---|
 | M0 | Baseline + doc | branch v4, this doc, verify v3.3 | `docs/` | 40/40 + ALL TESTS |
 | M1 | Sparse marginal | IR mass `(B,T,V)->` position-gather; loss reads (attn,nxt) | `hmn/v3.py`, `recipe.py` | **DONE**: parity 0.000e+00, 40/40 kept |
+| M3 | Multi-template | curriculum batch | `recipe.py`, `train_v3.py`, `gen_slots.py` | **PARTIAL**: trained templates -> 4/4 at 1.000 (import/run/apt went 0/40 -> 40/40); never-seen probes still 0.000 -> M2 relative gate is REQUIRED, confirmed |
 | M2 | Relative gate | learned gate w/ gen_margin | `hmn/v3.py` | template probes up |
-| M3 | Multi-template | curriculum batch | `recipe.py`, `train_v3.py`, `gen_slots.py` | unseen templates >= 36/40; original still 40/40 |
 | M4 | Think D1 | wire + validate on multi-step | `retop.py`, `train_v3.py`, `gen_chat.py` | thinking > no-thinking on multi-step |
 | M5 | GPU spec | silver/gold + MoE@large | `retop.py` | val good, no crash |
 | M6 | Think D2 | latent-slot (if M4 wins) | `hmn/v3.py`, `recipe.py` | beats D1 |
 | M7 | GUI v4 | toggles + v4 verify matrix | `retop_gui.py` | think/spec toggle usable |
-| M8 | Docs v4 | design doc, v4 guardrail, README | `docs/`, `experiments/verified/` | v4 guardrail pass + v3.3 still pass |
+| M8 | **Baseline** | HMN vs vanilla transformer & HMN3_NoReg, same size, same task | `experiments/` | quantify dual-register edge, honest README |
+| M9 | **CI** | GitHub Actions: guardrail + tests on every push | `.github/workflows/` | green on push |
+| M10 | Docs v4 | design doc, v4 guardrail, README | `docs/`, `experiments/verified/` | v4 guardrail pass + v3.3 still pass |
 | later | Server | streaming + OpenAI-style endpoint | new | — |
 
-Order M1 -> M4 is "smart before long": sparse marginal is done first because it
-is the base of the new IR (and shortens context cost as a side effect).
+Order M1 -> M3 -> M2 -> M4 is "smart before long": sparse marginal is done
+first because it is the base of the new IR. Multi-template (M3) runs BEFORE the
+relative gate (M2) — the gate generalization needs varied training data first,
+otherwise the learned gate trains on a single-template distribution and learns
+to be template-bound again (the v3.1 failure mode). M8/M9 (baseline + CI) were
+added from external review feedback.
+
+## 4b. External review feedback (2026-08-13) — how it maps
+
+| feedback | disposition |
+|---|---|
+| scope too narrow (slot-copy only) | M4 multi-step + F code domain |
+| gate template-bound | M3 multi-template (before M2) |
+| attention-mass tensor doesn't scale | M1 reduced copy-path duplicates; `(B,T,T)` sim identified as the true long-context work — recorded in §6 |
+| no CI | **M9 new** |
+| no baseline comparison (transformer same size) | **M8 new**: HMN3 vs HMN3_NoReg (in-repo ablation) vs vanilla transformer |
+| README claims "softmax cannot" | soften wording after M8 has numbers; note HMN3_NoReg IS the in-repo proof |
 
 ---
 

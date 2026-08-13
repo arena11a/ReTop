@@ -88,21 +88,30 @@ def make_chat_targets(ids, asid, eos):
     return y, yc, gt
 
 
-def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE):
+def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
+                    templates=None):
     """Slot-copy batch -> (X, Y, Yc, G).
 
     X: full teacher-forced <s><|user|>{template}<|assistant|>{template}</s>
     Y: shifted targets, -100 outside answer region (blend CE, incl. EOS)
     Yc: copy-channel targets, EOS/first-token forced -100 (register can't copy)
     G: gate target 1.0/0.0/-1.0 (see _slot_targets) — masks gen CE in loss_v33
+
+    v4 M3: pass `templates=[...]` to train on MANY templates in the same batch
+    (per-record rng.choice). This un-locks the gate from a single lexicon:
+    the gen head learns to OPEN the copy chain for any trained verb, and the
+    copy lane sees copy-conditions across templates. `template=` is kept for
+    v3.3 backward compat (single-template behavior unchanged).
     """
     rng = random.Random(seed)
     eos = tok.token_to_id(EOS)
     asid = tok.token_to_id(ASSIST)
+    tpls = templates if templates is not None else [template]
     X, Y, YC, G = [], [], [], []
     for _ in range(bs):
         p = rng.choice(slots)
-        user = gold = template.format(slot=p)
+        tpl = rng.choice(tpls)
+        user = gold = tpl.format(slot=p)
         ids = make_chat_ids(tok, user, gold)
         y, yc, gt = make_chat_targets(ids, asid, eos)
         X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
