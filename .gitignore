@@ -12,6 +12,9 @@ venv/
 env/
 retop_venv/
 
+# Research archive (v1/v2 kept local only)
+legacy/
+
 # PyTorch
 *.pt
 *.pth

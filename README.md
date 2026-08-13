@@ -192,8 +192,6 @@ hmn_v33.pt[.json]           verified checkpoint + recipe sidecar
 experiments/verified/slot_v33_seed42.py   one-command 40/40 guardrail
 docs/                       design + data-prep (hmn_v3_design.md, data_prep.md)
 data/                       training corpora (git-ignored, from gen_*.py)
-legacy/                     v1/v2 research: old generators, switch experiments
-                            (kept for history, not part of the pipeline)
 retop_tokenizer.json        the tokenizer (vocab 3190)
 ```
 
