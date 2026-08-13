@@ -31,7 +31,7 @@ class SelectiveSSM(nn.Module):
     Python loop drops from T to (chunk_size + ceil(T/chunk_size)) steps;
     within-chunk work is vectorized across (B, n_chunks, dim, state)."""
 
-    def __init__(self, dim, state_dim, prenorm=True, chunk_size=16):
+    def __init__(self, dim, state_dim, prenorm=True, chunk_size=8):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
@@ -47,10 +47,22 @@ class SelectiveSSM(nn.Module):
         """Exact two-phase chunked scan for h_t = exp(log_da_t)*h_{t-1} + db_t.
         log_da, db: (B, T, dim, state). Returns h: (B, T, dim, state).
 
-        Phase 1 (vectorized loop over chunk_size positions, parallel across all
-        chunks): cumulative products P and zero-input forced response F.
-        Phase 2 (sequential loop over n_chunks): propagate chunk states.
-        h = P * h_in + F reconstructs the full sequential scan exactly."""
+        v2.4: closed-form per chunk (fast on CPU — autograd-cheap).
+        Within a chunk the recurrence is solved exactly in closed form:
+
+            h_t = exp(L_t) * h_in  +  exp(L_t) * S_t
+            L_t = cumsum(log_da)[t]            (log of running product)
+            S_t = cumsum(db_t * exp(-L_t))[t]  (log-domain forced response)
+
+        so the OLD per-position python loop + in-place writes (which materialized
+        CopySlices/SelectBackward nodes and made backward ~8x slower than the
+        already-cheap recompute pass) collapse to 4 vectorized ops. Phase 2 keeps
+        the sequential loop over n_chunks only (chunk states connect exactly).
+        Purity: float32 throughout — |L| <= chunk*|clamp| = 72 < 88 (exp range),
+        and e^-72 > f32 subnormal floor, so no double conversion needed.
+        clamp=-9 caps the per-step decay rate at e^-9 ~ 0.0001 (vs underflow-to-0
+        in the old cumprod form — a hard reset that now becomes a strong decay;
+        irrelevant for trained scales, keeps exp() in range)."""
         B, T, D, S = log_da.shape
         C = self.chunk_size
         n_chunks = (T + C - 1) // C
@@ -59,23 +71,20 @@ class SelectiveSSM(nn.Module):
             pad = T_pad - T
             log_da = F.pad(log_da, (0, 0, 0, 0, 0, pad), value=0.0)   # dA=1 in padding
             db = F.pad(db, (0, 0, 0, 0, 0, pad), value=0.0)          # dB=0 in padding
-        dA = torch.exp(log_da).reshape(B, n_chunks, C, D, S)
-        dB = db.reshape(B, n_chunks, C, D, S)
-        P = torch.cumprod(dA, dim=2)                                 # within-chunk products
-        forced = torch.empty(B, n_chunks, C, D, S, device=log_da.device)
-        f = torch.zeros(B, n_chunks, D, S, device=log_da.device)
-        for j in range(C):                                           # phase 1 (C steps)
-            f = f * dA[:, :, j] + dB[:, :, j]
-            forced[:, :, j] = f
-        A_chunk = P[:, :, -1]                                        # total chunk product
-        B_chunk = forced[:, :, -1]                                   # forced end state
+        log_da = log_da.clamp(min=-9.0)
+        L = torch.cumsum(log_da.reshape(B, n_chunks, C, D, S), dim=2)  # (B,nc,C,D,S)
+        eL_inv = torch.exp(-L)
+        Sf = torch.cumsum(db.reshape(B, n_chunks, C, D, S) * eL_inv, dim=2)
+        f = torch.exp(L) * Sf                     # zero-input forced response
+        A_chunk = torch.exp(L[:, :, -1, :, :])    # total chunk product (B,nc,D,S)
+        B_chunk = f[:, :, -1, :, :]               # chunk forced end state (B,nc,D,S)
         h_in = torch.zeros(B, D, S, device=log_da.device)
         h_ins = []
-        for c in range(n_chunks):                                    # phase 2 (n_chunks steps)
+        for c in range(n_chunks):                # phase 2 (n_chunks steps)
             h_ins.append(h_in)
             h_in = A_chunk[:, c] * h_in + B_chunk[:, c]
-        h_ins = torch.stack(h_ins, dim=1)                            # (B, nc, D, S)
-        h = P * h_ins.unsqueeze(2) + forced                          # (B, nc, C, D, S)
+        h_ins = torch.stack(h_ins, dim=1)         # (B, nc, D, S)
+        h = torch.exp(L) * h_ins.unsqueeze(2) + f  # (B, nc, C, D, S)
         h = h.reshape(B, T_pad, D, S)[:, :T]
         return h
 

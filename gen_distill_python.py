@@ -11,6 +11,7 @@ Split: deterministic 80/20 by (topic, key) with seed. Chunked streaming jsonl,
 same format as gen_arithmetic.py so train_distill.py can reuse iter_records.
 """
 import argparse, json, os, random, hashlib
+from paths import DISTILL_PYTHON
 
 TOPICS = [
     "venv", "pip", "python_vs_python3", "gradle_build", "pyproject_setuptools",
@@ -400,8 +401,7 @@ def write_chunked(out_dir, records, chunk_size=500):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out",
-                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "hmn_data", "distill_python"))
+                    default=DISTILL_PYTHON)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--val-frac", type=float, default=0.2)
     args = ap.parse_args()

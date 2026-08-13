@@ -24,6 +24,7 @@ Record format (memory-compatible, v2):
 """
 
 import argparse
+from paths import RECALL
 import json
 import os
 import random
@@ -150,8 +151,7 @@ def main():
     ap.add_argument("--val", default=3000, type=int)
     ap.add_argument("--seed", default=42, type=int)
     ap.add_argument("--outdir",
-                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "hmn_data", "recall"))
+                    default=RECALL)
     ap.add_argument("--chunk", default=10000, type=int)
     ap.add_argument("--n-pairs-min", default=3, type=int)
     ap.add_argument("--n-pairs-max", default=15, type=int)

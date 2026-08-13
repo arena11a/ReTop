@@ -1,132 +1,183 @@
-# HMN v3 — Helix Register-Network
-### สถาปัตยกรรม AI ที่ "เหนือกว่า" AI สุ่ม-ผ่านชั้นเดียว (single-pass LLM) : คัดลอกได้แม่น, คิดได้ลึก, ประหยัดหน่วยความจำ
+# HMN v3.3 — Identity Register slot-copy (final)
+
+> Status: **validated 2026-08-13.** 40/40 unseen exact on the canonical task,
+> guardrail: `experiments/verified/slot_v33_seed42.py`. This document is the
+> from-the-failure-history account: what broke in v3.0→v3.2, what v3.3 does
+> instead, the measured numbers, and the honest boundaries of the mechanism.
 
 ---
 
-## 0. สรุปเหตุผลว่าทำไมต้องออกแบบใหม่ (จากหลักฐานจริงของโปรเจกต์)
+## 1. The problem that motivated v3
 
-ทุกสถาปัตยกรรมที่เคย tested กับสร้างเป็น single-pass probabilistic generator:
-"อ่าน context → forward หนึ่งรอบ → softmax → sample" แปลว่า:
-
-| ข้อจำกัดของ AI แบบเดิม (verified ในโปรเจกต์เอง) | หลักฐาน |
-|---|---|
-| contextualization (SSM/MoE) ทำลาย content-address ของหน่วยความจำ | HMN เต็ม: 14% → memory อ่าน raw embedding: 62% → +β30+usage: 99% (task2_findings #3,#10) |
-| slot-copy เป็นเพดาน — LM head ออก soft distribution ไม่มีวิธีก๊อบปี้ token จาก prompt เป๊ะ | val exact 0/40, train exact 9/40, pip slot ผิด 100% val (distill_design) |
-| คิดหลายขั้น vs คิดครั้งเดียว ต้องนับขั้นเป็น tokens เพิ่ม (chain-of-thought) — เสีย tokens, ชา, ควบคุมยาก | distillation ต้องการ "rule + copy + verify" ครบ แต่ single-pass ทำไม่ได้ |
-| ไม่มีการยืนยันคำตอบ (self-check) ใน forward เดียว | run_exact / syntax ยังไม่ 100% แม้ rule ถูก |
-
-**สมมติฐานหลักของ v3:** คำตอบที่ถูกต้องมีสองชนิดที่ต้องการช่องสัญญาณ (channel) ต่างกัน
-- **Literal / copy** (ค่าที่มีอยู่แล้วใน context: "pip install {pkg}", เลขจากหน่วยความจำ) → ต้องมีช่องก๊อบปี้ตรง (hard copy) ไม่ใช่ดูดออกจาก softmax
-- **Computed / generated** (กติกาใหม่, paraphrase, reasoning) → ต้องมีช่องประมวลผล (abstraction) ซึ่ง v2 ทำได้ดีอยู่แล้ว
-
-AI ที่เหนือกว่าคือ AI ที่รู้ว่า **เมื่อไหร่ต้อง copy เมื่อไหร่ต้อง generate และจัดจ้างเวลา "คิด" เพิ่มได้เมื่อยาก** — ไม่ใช่แค่ soft attention เดียวที่ทำให้ทุกอย่างคลุมเครือ
-
----
-
-## 1. สามแนวคิดหลักของ v3 (novel contributions)
-
-### 1.1 Two-Register Processing (WR + IR)
-
-- **Working Register (WR)** — backbone เดิม (reversible SSM + MoE): สร้าง contextual abstraction ใช้ reasoning
-- **Identity Register (IR)** — ตาราง slot ใหม่ (global, content-addressable, read only) เก็บ **token identity ดิบ**
-  ไม่ถูก contextualize โดย SSM/MoE → สรุป: หลักฐาน #3 พิสูจน์แล้วว่าการทำแบบนี้ให้ recall **99%**
-
-### 1.2 Dual-Head Decoder: Copy-Head ⊕ Generate-Head
-
-Decoder ไม่มี head เดียว desเท่านั้น แต่มีสองหัว แบ่งงานตาม quantum ของคำตอบ:
-
-- **Copy-Head** (head ที่เขียนด้วย `nn.Linear` → logit ของ token *จาก IR ที่ retrieve ตรง*):
-  อ่าน memory ตำแหน่งที่ WR ระบุ address → เอาค่า token **ตรงๆ** เป็น candidate
-- **Generate-Head** (LM head เดิม): softmax เหนือ vocab
-- **Router กลาง**: `g = σ(W·[h, mem_read])` — ถ้า copy-head มี **confidence สูง** (การ gating ฝั่ง memory)
-  → ตอบด้วย hard copy (exact); ถ้าไม่ → generate
-
-> ต่างจาก pointer-generator (pointing เข้า attention weights) คือ copy-head ของเราชี้ไปยัง **episodic memory
-> map ทุก cell** (ไม่ใช่แค่ input window) — จึงก๊อบปี้ได้ทั้ง token ที่อยู่ใน context หลายพัน tokens ก่อนหน้า
-> และค่าที่ memory รวมเขียนเก็บไว้ (multi-token value) → สองสิ่งมาถึง focus เสมอโดยไม่หาย
-
-### 1.3 Adaptive Latent Thinking (Latent CoT)
-
-ชดเชยข้อจำกัด "single-pass" ที่ AI ทั่วไปมี: หลัง WR forward รอบแรก ไม่ output ทันที แต่มี
-**deliberation loop** — รัน recurrence ต่อใน latent space (ไม่ใช่ token) K รอบ แล้วหยุดเมื่อ convergence:
+The v2 family (reversible coupling + MoE + episodic memory) recalled key→value
+tokens at 97–99% (`docs/task2_findings.md`), but hit a hard wall on
+**slot-copy**:
 
 ```
-for k in range(K_max):            # K adaptive
-    h_k = block_clip(h_{k-1})     # refine hidden โดยไม่ต้อง decode เป็นคำ
-    conf = output_confidence(h_k) # entropy ของ head ล่าง
-    if conf ถึงเกณฑ์ -> break
-logits = dual_head(h_k)           # ถ่ายทอดรอบสุดท้าย
+user:   pip install pkg042
+answer: pip install pkg042     ← must re-emit the EXACT literal
 ```
 
-- **คิด** โดยไม่เปลือง tokens, ไม่ใช่ chain-of-thought แบบข้อความ
-- คุ้มบน CPU เพราะเป็นการรัน backbone ซ้ำ (reversible → activation ถูก reconstruct ฟรี)
-- **K ปรับตามความยาก** ของ input (entropy-based) — แก้ค่า use-compute ตามปัญหา ได้ AI-"ใช้เวลา/คิดเพิ่มได้"
+with *unseen* slots (`pkg060..pkg099`, never in training) the softmax head scored
+**0/40 exact**. The mechanism failure is structural, not a matter of scale:
+
+> A softmax head is a distribution over a fixed vocabulary. Re-emitting an unseen
+> token like the digits `04`/`2` of `pkg042` requires that token's shared
+> embeddings to have been pushed by gradient — which never happened for the exact
+> digit sequence, because distinct 3-digit suffixes are combinatorially rare.
+> The head can only emit a *blurred average* of "some pkg-suffix", never the
+> exact literal (measured: `pip slot ผิด 100% val`, distillation attempt 3).
+
+**v3's thesis:** separate the answer into two channels and let a learned gate
+route per token — *copy the prompt's exact tokens*, *generate the rest*.
 
 ---
 
-## 2. สถาปัตยกรรมรวม (Full Assembly)
+## 2. The architecture that works (v3.3-final)
 
 ```
 input_ids
    │
-   ├── ▶ [Embedding] ──────────────┬──────▶ Identity Register (IR)
-   │                               │        ("literal lane", ใช้ token ดิบ)
-   │                               │
-   │   [WR: L× (Reversible SSM ⊕ MoE)]
-   │                 │
-   │                 └── [IR unify]: address ← WR h_t, retrieve IR → mem_read
+   ├─▶ [Embedding] ──────────▶ Identity Register (IR)  "literal lane"
+   │                              │
+   │   [WR: L× SelectiveSSM]      │
+   │         │                    │
+   │         ▼                    ▼
+   │   ctx state h_t ──▶ gate/select ──▶ copy_dist over {tokens in prompt}
    │
-   │   [Thinking Buffer]   loop K: WR re-run on last hidden + gated mem_read
-   │
-   └── [Dual Head]
-          ├── Copy-Head   : memory read -> exact candidate (hard)
-          └── Generate-Head: LM softmax
-          → gate g:  g·copy_logits + (1-g)·gen_logits   (g เรียนรู้ว่าเมื่อไหร่ copy)
+   └─▶ [DualHead]  gen_logits (WR, softmax)  ⊕  copy_dist (IR, p(·|prompt))
+                          g = gate(h_t)          final = (1-g)·gen + g·copy
 ```
 
-IR เป็นช่องที่อ่านข้อมูลดิบทุก forward (ไม่ใช่แค่ตอนมี instruction) เพื่อให้ Copy-Head มีที่ก๊อบปี้ได้เสมอ
+- **Working Register (WR):** the v2 backbone. Produces contextual hidden states
+  for generation.
+- **Identity Register (IR):** raw-embedding lane, *not* contextualized by the
+  backbone (that was the v2 finding: contextualization destroys content-address,
+  14% → 99% switch). The copy distribution = attention over prompt token *ids*
+  (v3.x `HMN3` in `hmn/v3.py`).
+- **Pointer / gate supervision (v3.3):** for each answer target, the IR must
+  attend to the prompt position whose *next* token equals the target — a
+  "what follows the token I just emitted" bigram lookup.
+  `make_chat_targets` (in `hmn/recipe.py`) derives, per sequence:
+  - `Y` — shifted targets for the blended head, answer region only;
+  - `Yc` — copy-channel targets, EOS and the first answer token masked off (the
+    register cannot copy either — EOS isn't in the prompt, and the first answer
+    token's seed is `<|assistant|>`, also absent);
+  - `G` — `1.0` if the target has an exact copyable twin in the prompt, `0.0`
+    otherwise. This triple is the whole recipe's input.
+
+### Loss — `loss_v33` (single source of truth)
+
+```
+L = CE(blend_logits, Y)                       # final answer correctness
+  + w_copy · CE(gen_logits, Y)[G == 0 rows]   # gen owns ONLY generate rows
+  + w_copy · mean(−log p_copy(target))        # manual -log p on copy_dist
+```
+
+Three traps this encoding was designed to avoid (each was a real bug, §4).
+
+### Decode — `decode_v33`, `boundary_eos`
+
+- `blend`: `argmax((1-g)·gen + g·copy)`.
+- `hard`: if `g > 0.5`, `argmax(copy)`, else blend.
+- `boundary_eos` (structural rule): in slot-copy every answer token after the
+  first has an exact prompt twin ⇒ its gate ≈1. The *only* row where the gate
+  can collapse mid-answer is the final one — and that row must emit EOS. So:
+  **when the gate drops below threshold after step 0, force EOS.** This turns a
+  per-slot lottery (~1–2 fails/seed) into a deterministic boundary.
+
+`hmn/recipe.py` centralizes `make_chat_ids`, `make_chat_targets`,
+`make_slot_batch`, `loss_v33`, `decode_v33`, `eval_slots`. `train_v3.py`,
+`retop.py`, `infer.py` all call these — the loss math can no longer drift across
+files.
 
 ---
 
-## 3. เกณฑ์ success ที่วัดได้ (ตรงเพดานที่พังของ v2)
+## 3. Verified numbers
 
-| Task | v2 (verified) | v3 เป้าหมาย |
+Config: D96/L3, state_dim 8, gate_bias −1.0, `w_copy` 1.0, batch 8, lr 3e-4,
+1400 steps, seed 0, CPU (~15 min). Train = `pip install pkg000..059`; eval =
+`pkg060..099`, zero overlap (`gen_slots.py` guarantees the disjoint split).
+
+Run `python experiments/verified/slot_v33_seed42.py`.
+
+| Eval (40 unseen) | exact |
+|---|---|
+| blend + boundary_eos | 40/40 |
+| hard (gate>0.5 → copy) | 40/40 |
+| structural variant `pip install -r {slot}` (never trained) | 40/40 |
+| reproducibility sweep 5 seeds × 40 | 200/200 |
+
+## 4. The failure history (why each choice is a choice)
+
+### 4.1 The learned gate must stay deterministic
+Tried (v3.0–v3.1 phase): entropy-based gate, soft top-k gate, gate = max same-
+token-id copy mass. All collapsed mid-training — the copy mass for *any* token
+can look confident under a soft distribution, so the gate learned to trust the
+generate head everywhere instead, and slot-copy silently reverted to softmax
+behavior. **Resolution:** the gate is trained with a hard target (`G ∈ {0,1}`)
+and combined deterministically with `make_chat_targets`; decode uses the
+*structurally-defined* rule, not a "confidence the network invented".
+
+### 4.2 CE-on-probs — the frozen-loss bug (v3.1→v3.3, most expensive)
+`copy_dist` is already a probability distribution (sums to 1). Using
+`CrossEntropyLoss(copy_dist, Y)` re-log-softmaxes it and pins the loss at
+~ln(VOCAB)=7.07 with a dead gradient. This was the cause of every "frozen"
+training curve since v3.1. **Resolution:** manual `−log p_target` via gather;
+`test_hmn.py::test_recipe_copy_ce_is_manual_logp` is a regression guard (it
+fails if anyone reintroduces CE-on-probs).
+
+### 4.3 gen CE must be masked to generate rows
+Training the gen head on *copy* rows makes it memorize the slot digits, so at
+the boundary row it fires the same copied token instead of EOS (`pkg060→'OST'`,
+`pkg066→'6'` loop). **Resolution:** `G != 0` rows are masked out of the gen CE;
+the gen head owns exactly the first answer token, the EOS, and absent targets.
+
+### 4.4 The decode boundary is a rule, not a guess
+Relying on the gen head to realize "the last copied token is followed by EOS"
+per-slot failed ~1–2 slots per seed. **Resolution:** `boundary_eos` (a faithful
+encoding of the *task structure*): the register gate provably drops at the final
+row, so force EOS there. This removed the last nondeterminism in exact-match.
+
+### 4.5 Special-token / encoding bugs
+The tokenizer's BPE *can* split concatenated special tokens
+(`"<|assistant|>"` → 3 ids when glued to text). `make_chat_ids` encodes each
+part separately and joins ids — the invariant `test_recipe_chat_ids_no_special_split`
+keeps every chat special at exactly one id.
+
+## 5. Measured generalization & known limitations
+
+The Identity Register generalizes over slot **values** (unseen 3-digit packages,
+alphanumeric `pkgA12`, `xy12`) — but it is **not** yet a general copy operation:
+
+| Probe | result | explanation |
 |---|---|---|
-| Slot-copy: `pip install {pkg}` บน 120 val (ไม่เห็น slot ใน train) | 0/40 exact, pkg ผิดเกือบหมด | **≥90% copy-exact** (ผ่าน hard-copy) |
-| Recall single-token (8 คู่/50 keys, random-query) | 97-99% | ไม่แย่ลง (≥97%) |
-| syntax/API บน unseen templates | syntax 70%, API 89% | ≥ v2 + run_exact สูงขึ้น |
-| งาน composite "copy+compute" (e.g. บวกค่าที่ต้อง copy ออกจาก memory ก่อน) | ยังไม่ได้ทดสอบ | ≥80% |
+| 4-/5-digit slots | ~37/40 | longer copy chains mostly exact; occasionally the pointer leaks |
+| alphanumeric slots | 30/30 (`pkgL12` & lowercase `xy12` styles) | register is digit/template-agnostic in mechanics |
+| `import/run/apt install {pkg}` templates | **0/40** | the gate is lexicon-bound to the trained template; the model never learned "copy the prompt tail" as a context-free op |
+| repeated-digit slots `pkg333..999` | ~3/9 | the copy lane loops (gate stays ≥0.93 copying the same token); `boundary_eos` cannot fire because the gate never drops |
 
----
+Section 5 is updated from the guardrail — run
+`slot_v33_seed42.py` to reprint; the assert-guards cover only the six numbers in
+§3, the probes are printed not asserted.
 
-## 4. แผน implementation + validation (CPU-friendly)
+## 6. Limitations & future work
 
-1. **Write `IdentityRegister`** — ตาราง slot (cells) เก็บ `(key_id, value_ids[])`, content-address ด้วย raw embed,
-   read = hard-attention (retrieve เต็ม value) — แยกจาก memory ของ v2 (ไม่ต้องการ training gate ซับซ้อน)
-2. **Write `DualHead`** — copy-head อ่านจาก IR + gate; backward ที่เป็น trainable soft blend
-   โดย forward ตอบ hard copy เมื่อ gate สูง (STE เดิม) — เหมือนแนวคิด v2.3 STE
-3. **Write `LatentBuffer`** — deliberation loop, greedy best-K (K adaptive จาก entropy)
-4. **Test harness `experiments/poc_hmn_v3.py`** — 3 tasks ข้างต้น + เทียบ v2
+- `(B, T, vocab)` copy-mass tensor per forward: fine for toy lengths, must be
+  reworked (marginalize copy over present-token ids) before scaling context.
+- Template-general gating (4.5/5) is the single biggest open problem — a
+  context-free trigger "my next token is verbatim somewhere in the prompt"
+  would make the copy lane a general operation.
+- Repeated-token loops (5) need a copy-chain consistency check at decode
+  (e.g. abort copy when the target was already emitted and gate stays maximal).
+- Latent Thinking Buffer (`HMN3 use_think`, `k_max`) exists in the code but is
+  not part of the verified slot-copy result; unvalidated for this task.
 
-ทุกขั้น train ได้บน CPU (~0.2-0.4 s/step) ดังนั้นไม่จำกัดเวลาในการคิด/ทดสอบตามที่ต้องการ
+## 7. Reproducing
 
----
-
-## 5. สิ่งที่ยืนยันแล้วจาก v2 → ใช้ต่อใน v3 (ไม่ทดสอบซ้ำ)
-
-- Pre-LN บังคับ (Post-LN ระเบิด step 63) — v2 doc §18 ✅
-- Reversible backbone reconstruct แม่นยำ (error ~1e-7) — ประหยัด activation สำหรับ thinking loop ✅
-- β=30 + usage_decay + key/value split ทำให้ memory recall 99% ✅
-- Combined write (multi-token value ใน cell เดียว) ✅
-- STE สำหรับ continuous gate (soft in backward, hard in forward) ✅
-
----
-
-## 6. สิ่งที่ยังเป็น open question ของ v3 (วางไว้ให้ทดสอบ)
-
-- IR ควรเป็น "cell จริง" หรือ "pointer ไป input"? (แล้วแต่ tradeoff: cell = สากลกว่า, pointer = ประหยัดกว่า)
-- copy-head ควร integrate กับ memory cell (เขียน+อ่าน) หรือแยก register สำหรับ literal copy เท่านั้น
-- latent thinking ควรวนบน hidden ของ layer ใด (top vs middle) จึง maximized convergence
-- gate ควรเป็น per-token สำหรับ sequence (บาง token copy บาง token generate) — จุดนี้ยิ่งทำให้ strong
-
----
+```bash
+python gen_slots.py --out data/slots.jsonl --n-seen 600 --n-unseen 400 --seed 0
+python train_v3.py --steps 1400 --arch v31 --save hmn_v33.pt
+python experiments/verified/slot_v33_seed42.py            # asserts 40/40
+python test_hmn.py                                        # recipe guardrails
+```

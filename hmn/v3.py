@@ -29,63 +29,110 @@ from hmn.v2 import HelixCouplingBlock, ReversibleFunction, SparseConditionalComp
 
 
 class IdentityRegister(nn.Module):
-    """Literal token lane. Register rows = raw token embeddings of distinct
-    tokens present in the context. Copy scores are a SOFT attention-marginal
-    over context positions (pointer-style): copy_logit(token t) =
-    sum_j a_j * 1[id_j == t] where a = softmax(beta * sim(key(h), embed_j)).
-    Fully differentiable in training (the router learns which position to
-    attend -> can emit an EXACT context token on eval). Returns:
-      - copy_logits over vocab (bounded floor -30 elsewhere)
-      - retrieved context vector (same attention blend) for the gate
+    """Literal token lane (v3.3 — "next-token lookup"). 
 
-    Addressing / Payload split (v3 innovation):
-      ADDRESS in meaning-space = contextual WR states (h). Context distinguishes
-      duplicate tokens ("pkg061's p" vs "pip's p" — identical raw vectors, so
-      content-attention on raw embeds cannot localize them; task2 held the
-      opposite lesson but that was for write-then-read storage consistency,
-      not single-pass copy).
-      PAYLOAD in token-space = the raw token id at the addressed position, so
-      the emitted token is EXACTLY the context token (pointer-generator).
+    v3.1 used a contextual query vs context keys: the COPY channel then had to
+    decode 'which token do I want next' through a single linear map — impossible
+    per-position routing (measured 2026-08-12: ptr CE frozen at 2.08, copy CE
+    frozen at 7.27 for 1500 steps; attention never sharpened past ~uniform;
+    seen-only memorization, unseen 0/40). v3.2 (raw keys, same query) fixed
+    nothing — the blocker is the QUERY, not the keys.
+
+    v3.3 makes the register a pure identity lookup:
+      query  = RAW embedding of the CURRENT token ids[t] (keys, unshifted)
+      keys   = RAW embeddings of the prompt region (identity lane)
+      a      = softmax(beta * cos(query, key_j))   <- self-match is EXACT (=1)
+      payload= the token at position j+1 (what FOLLOWS the matched token)
+
+    => 'the token right after the last thing I emitted/positioned'. For
+    slot-copy ("pip install pkg061" -> answer "pip install pkg061") the chain
+    is: seed=pip -> self-match prompt 'pip' -> copy 'install'; seed=install ->
+    copy 'pkg061' UNSEEN token. The gen head emits the stable first answer
+    token and EOS (both gutter rows: seed=ASI unreachable, payload=ASI != EOS);
+    the gate learns when the lookup is reliable (tends ON in the mirror body,
+    OFF at gutter rows). Corrected 2026-08-13: the seed MUST be ids[t], not
+    ids[t-1] — the prev-shift made the register answer the already-seen token.
+
+    This mirrors the verified v2 lever (task2 #10): addressing that is
+    IDENTITY-based (raw embed self-match) hit 97-99% recall; contextual
+    addressing stayed 51-62%. Identity lookup generalizes to unseen tokens
+    because no knowledge about the token is needed — only its position.
     """
 
-    def __init__(self, dim, beta_init=8.0, asi_id=None):
+    def __init__(self, dim, beta_init=30.0, asi_id=None, keys_proj=False, eos_id=1):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(beta_init)))
         self.asi_id = asi_id
+        self.eos_id = eos_id
         self.key_proj = nn.Linear(dim, dim)
+        self.keys_proj = nn.Linear(dim, dim) if keys_proj else None
 
-    def forward(self, ctx_h, ids, query):
-        # ctx_h: (B, T, dim) CONTEXTUAL WR states (addressing keys)
+    def forward(self, keys, ids, query, return_attn=False):
+        # keys:  (B, T, dim) RAW token embeddings (identity lane, addressing)
         # ids:   (B, T) raw token ids (payload)
-        # query: (B, T, dim) contextual query (WR state at query position)
-        B, T, D = ctx_h.shape
+        # query: (B, T, dim) — v3.3: IGNORED for addressing (contextual query
+        #        was the v3.1 blocker); kept in signature for API compat.
+        B, T, D = keys.shape
         beta = self.beta.abs() + 1.0
-        qk = F.normalize(self.key_proj(query), dim=-1)         # (B,T,D)
-        ek = F.normalize(ctx_h, dim=-1)                        # (B,T,D) contextual addr
-        sim = (qk @ ek.transpose(-1, -2)) * beta               # (B,T,T) prices
-        # causal + configurable copy-set (see below)
-        mask = torch.triu(torch.ones(T, T, device=query.device, dtype=torch.bool), 1)
-        # COPY-SET: legal copy targets = PROMPT-region tokens (before the
-        # <|assistant|> boundary). Self-copy of generated tokens would let the
-        # model loop its own output (observed in PoC). Slot values / recall
-        # answers live in the prompt, so nothing is lost.
+        # v3.3 CORRECTION (measured 2026-08-13): the query lane is the CURRENT
+        # token ids[t] (keys, NOT shifted to prev). Decode chain:
+        #   t=11 .. t=17 seed=p,ip,..  self-match the token's OWN prompt twin
+        #   (cos=1 exact -> column == ptr) and payload = what follows it (the
+        #   mirror target). t=10 seed=ASI (absent from prompt) -> copy fails ->
+        #   gate off -> gen head emits the stable first token; t=18 seed=1 ->
+        #   payload ASI (not EOS) -> gate off -> gen emits EOS. Using prev
+        #   (== the CURRENT position's predecessor) forced ASI/quirk queries to
+        #   run the copy lane on the first answer token and broke the chain.
+        qk = F.normalize(keys, dim=-1)                              # (B,T,D) ids[t]
+        ek = qk                                                     # identity addrs
+        sim = (qk @ ek.transpose(-1, -2)) * beta                    # (B,T,T)
+        # causal + legal payload columns. A column j is copyable iff:
+        #   (1) j is in the PROMPT region (before <|assistant|>), and
+        #   (2) its payload ids[j+1] is a NORMAL token (not ASI / not EOS / not
+        #       past the end). Excluding ASI/EOS payload columns makes the
+        #       boundary rows self-deactivate: the LAST prompt token only ever
+        #       points at ASI, so no seed can produce a sharp lookup that ends
+        #       in ASI/EOS — attention there spreads and the gate goes low.
+        mask = torch.triu(torch.ones(T, T, device=keys.device, dtype=torch.bool), 1)
         if self.asi_id is not None and (ids == self.asi_id).any():
-            idx = (ids == self.asi_id).float().argmax(-1, keepdim=True)  # (B,1), -1 if absent
+            idx = (ids == self.asi_id).float().argmax(-1, keepdim=True)  # (B,1)
             have = (ids == self.asi_id).any(-1, keepdim=True)            # (B,1)
             bound = torch.where(have, idx, torch.full_like(idx, T)).long()
-            tgt = torch.arange(T, device=query.device).unsqueeze(0)      # (1,T)
-            legal = (tgt.unsqueeze(1) < bound.unsqueeze(-1))             # (B,T,T)
+            legal = (torch.arange(T, device=keys.device).unsqueeze(0).unsqueeze(1)
+                     < bound.unsqueeze(-1))                              # (B,1,T)
             mask = mask.unsqueeze(0).expand(B, T, T) | ~legal
+        # payload per column: ids[j+1]; last column has no successor
+        nxt_col = torch.cat([ids[:, 1:], torch.full_like(ids[:, :1], -1)], dim=1)
+        bad_payload = (nxt_col == self.asi_id) | (nxt_col == self.eos_id) | (nxt_col == -1)
+        mask = mask | bad_payload.unsqueeze(1).expand(B, T, T)
         sim = sim.masked_fill(mask, float("-inf"))
         a = sim.softmax(-1)                                    # position attention
-        # token mass = attention summed over token id (sums to ~1 per position);
-        # tokens absent from the context stay at exactly 0. pure PROBABILITY scale
-        # (no logit floor — the decoder blends on probabilities).
-        mass = torch.zeros(B, T, self.vocab, device=query.device)
-        mass = mass.scatter_add(-1, ids.unsqueeze(1).expand(B, T, T), a)  # (B,T,V)
-        # context vector = attended blend of CONTEXTUAL states (gate's memory read)
-        ctx = (a.unsqueeze(-1) * ctx_h.unsqueeze(1)).sum(2)    # (B,T,D)
-        return mass, ctx
+        # # of legal columns per row (for entropy normalization of the gate)
+        n_legal = (~mask).sum(-1)                               # (B,T)
+        # PAYLOAD = token at position j+1 (masked-off columns carry 0 weight,
+        # so their zeroed payload index never scatters).
+        nxt = torch.cat([ids[:, 1:], torch.zeros_like(ids[:, :1])], dim=1)
+        mass = torch.zeros(B, T, self.vocab, device=keys.device)
+        mass = mass.scatter_add(-1, nxt.unsqueeze(1).expand(B, T, T), a)  # (B,T,V)
+        # context vector = attended blend of RAW keys (gate's memory read)
+        ctx = (a.unsqueeze(-1) * keys.unsqueeze(1)).sum(2)     # (B,T,D) raw blend
+        # GATE mass: sum of attention over columns j whose token id EQUALS the
+        # seed ids[t] (exact in-prompt duplicates, incl. the diagonal when
+        # legal). ~1 for body rows, collapses toward 0 at ASI/EOS boundaries
+        # whose only twin was payload-masked. drivbos the deterministic gate.
+        same = (ids.unsqueeze(1) == ids.unsqueeze(2))          # (B,T,T)
+        mass_same = (a * same.float()).sum(-1)                 # (B,T) 0..1
+        # rows at/before the ASI boundary (prompt + the row that predicts the
+        # FIRST answer token) are FORCED gen rows: their seed is ASI-adjacent
+        # and the copy lane must not run there (train/decode consistency).
+        behind = torch.zeros(B, T, dtype=torch.bool, device=keys.device)
+        if self.asi_id is not None and (ids == self.asi_id).any():
+            bound2 = torch.where(have, idx, torch.full_like(idx, T)).squeeze(-1).unsqueeze(1)
+            behind = torch.arange(T, device=keys.device).unsqueeze(0) <= bound2
+
+        if return_attn:
+            return mass, ctx, a, n_legal, behind, mass_same
+        return mass, ctx, n_legal, behind, mass_same
 
     def set_vocab(self, v):
         self.vocab = v
@@ -95,30 +142,68 @@ class DualHeadDecoder(nn.Module):
     """gen ⊕ copy. Pointer-generator style: final distribution is a convex blend
       p = (1-g)*softmax(gen) + g*copy_dist
     returned as log p. copy_dist = register attention mass over vocab (an exact
-    context token can get ~1.0 mass -> hard copy achievable). g learned per
-    token from [h, ctx]. This keeps both paths on the SAME probability scale, so
-    the copy path actually gets shaped during training (with a gen head that
-    could otherwise memorize seen slots)."""
+    context token can get ~1.0 mass -> hard copy achievable).
+
+    g is now DETERMINISTIC (v3.3-final, measured 2026-08-13): the copy lane is
+    trustworthy iff the query's attention mass lands on a column holding the
+    SAME token id as the seed (an exact string duplicate in the prompt). We sum
+    attention over same-token-id columns:
+        gate_mass = sum_j a_j * [ids[j] == ids[t]]
+        g = sigmoid(tau * (gate_mass - thr))
+    An exact in-prompt twin gives ~0.99 (on); when the seed's only twin is the
+    ASI/EOS-boundary column (excluded by the payload mask) that column carries
+    zero softmax mass, gate_mass collapses toward 0, and gen must emit
+    (EOS/first token). Top-1 mass and entropy gates were both tried and failed:
+    at a boundary row attention falls back 'medium-sharp' on a WRONG token and
+    both signals stay high, so decode looped the slot value forever.
+    A learned gate on [h, ctx] (v3.1-v3.3) collapsed to ~0.05 — same outcome
+    via a different mechanism (see identity-register postmortem).
+    """
 
     def __init__(self, dim, vocab, tie_embed=None, gate_bias=0.0):
         super().__init__()
-        self.gen = nn.Linear(dim, vocab, bias=False)
-        self.gate = nn.Linear(dim * 2, 1)
+        # gen takes [h, gate_mass, behind] (dim+2): the two extra channels are a
+        # DIRECT boundary signal. At the last answer row gate_mass collapses to
+        # ~0 while behind=0, so gen can learn a reliable "emit EOS" rule there
+        # instead of a per-slot lottery (pkg094 'rude' bug, 2026-08-13). At the
+        # first-answer row behind=1 -> 'pip'. Without these gen is a bare
+        # Linear(h) and ~1-2/40 unseen slots flip the EOS decision per seed.
+        self.gen = nn.Linear(dim + 2, vocab, bias=False)
         self.gate_bias = gate_bias
+        self.tau = nn.Parameter(torch.tensor(12.0))
         if tie_embed is not None:
-            self.gen.weight = tie_embed
+            # tie only the h-cols (embed is dim-wide); the two extra boundary
+            # channels stay free.
+            self.gen.weight.data[:, :dim] = tie_embed.detach()
 
-    def forward(self, h, copy_logits, ctx, eps=1e-8):
-        gen = torch.log_softmax(self.gen(h), -1)
+    def forward(self, h, copy_logits, ctx, attn=None, n_legal=None, behind=None,
+                gate_mass=None, eps=1e-8):
+        if gate_mass is not None:
+            b = behind.unsqueeze(-1).float()
+            gm = gate_mass.unsqueeze(-1)
+            gen = torch.log_softmax(self.gen(torch.cat([h, gm, b], -1)), -1)
+            # deterministic same-token-id gate (see class docstring).
+            # threshold 0.5 fixed: exact twin ~0.99, boundary ~0.
+            g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - 0.5))
+                              .clamp(-6.0, 6.0))
+            g = g * (1.0 - b)                      # prompt/ASI rows: gen
+        else:
+            # legacy path (no attn provided): fall back to a static open gate
+            gen = torch.log_softmax(self.gen(
+                torch.cat([h, torch.zeros_like(h[..., :1]), torch.zeros_like(h[..., :1])], -1)), -1)
+            g = torch.sigmoid(torch.full_like(gen[..., :1], self.gate_bias).clamp(-3, 3))
         # copy mass already sums ~1 over vocab; renormalize to be safe
         copy_dist = F.normalize(copy_logits, p=1, dim=-1)
-        # clamp gate logit: keep the blend in a regime where BOTH paths keep
-        # receiving gradient (g exactly 1 murders the gen path -> model regresses
-        # to copying the prompt forever, observed in PoC).
-        gl = self.gate(torch.cat([h, ctx], -1)) + self.gate_bias
-        g = torch.sigmoid(gl.clamp(-3.0, 3.0))
         p = (1 - g) * gen.exp() + g * copy_dist
         return torch.log(p.clamp(min=eps)), g
+
+    def gen_probs(self, h, gate_mass, behind):
+        """Conditioned gen distribution for external logging/aux CE. Mirrors
+        forward() so HMN3.forward's gen_logits uses the SAME [h,gm,behind]
+        input the blend does (otherwise the aux CE trains a different head)."""
+        b = behind.unsqueeze(-1).float()
+        gm = gate_mass.unsqueeze(-1)
+        return torch.log_softmax(self.gen(torch.cat([h, gm, b], -1)), -1)
 
 
 class LatentThinkingBuffer(nn.Module):
@@ -159,7 +244,7 @@ class HMN3(nn.Module):
 
     def __init__(self, vocab_size, dim=96, state_dim=8, n_layers=3, n_experts=16,
                  top_k=2, use_moe=False, use_think=False, k_max=4, tie_weights=True,
-                 gate_bias=0.0, aux_copy=True, asi_id=None):
+                 gate_bias=0.0, aux_copy=True, asi_id=None, keys_proj=False):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
@@ -170,7 +255,7 @@ class HMN3(nn.Module):
         self.moe_list = nn.ModuleList([
             SparseConditionalCompute(dim, n_experts, top_k) if use_moe else None
             for _ in range(n_layers)])
-        self.ir = IdentityRegister(dim, asi_id=asi_id)
+        self.ir = IdentityRegister(dim, asi_id=asi_id, keys_proj=keys_proj)
         self.ir.set_vocab(vocab_size)
         self.dual = DualHeadDecoder(dim, vocab_size,
                                     tie_embed=self.embed.weight if tie_weights else None,
@@ -193,22 +278,26 @@ class HMN3(nn.Module):
             return h
         return _block_fn
 
-    def forward(self, input_ids, return_gate=False):
+    def forward(self, input_ids, return_gate=False, return_attn=False):
         ids = input_ids
-        x = self.embed(ids)
+        x = self.embed(ids)                       # raw token lane (IR keys)
         block_fn = self.blocks_apply()
         h = block_fn(x)
         if self.use_think:
             h = self.think(h, block_fn)
-        copy_logits, ctx = self.ir(h, ids, h)
-        logits, g = self.dual(h, copy_logits, ctx)
-        if self.aux_copy:
-            copy_dist = F.normalize(copy_logits.clamp(min=0.0), p=1, dim=-1)
-            d = {"logits": logits, "g": g, "copy_dist": copy_dist}
-            return d
+        # v3.3-final: the deterministic gate is read off the register attention,
+        # so always compute it (cheap) and hand it to the dual head.
+        copy_logits, ctx, attn, n_legal, behind, gate_mass = \
+            self.ir(x, ids, h, return_attn=True)
+        logits, g = self.dual(h, copy_logits, ctx, attn=attn, n_legal=n_legal,
+                              behind=behind, gate_mass=gate_mass)
+        gen_logits = self.dual.gen_probs(h, gate_mass, behind)
+        copy_dist = F.normalize(copy_logits.clamp(min=0.0), p=1, dim=-1)
+        d = {"logits": logits, "g": g, "copy_dist": copy_dist, "attn": attn,
+             "n_legal": n_legal, "gen_logits": gen_logits}
         if return_gate:
             return logits, g
-        return logits
+        return d
 
 
 class HMN3_NoReg(nn.Module):

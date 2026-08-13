@@ -1,0 +1,22 @@
+{
+  "checkpoint": "hmn_v33.pt",
+  "arch": "v3",
+  "recipe": "hmn/recipe.py (v3.3-final)",
+  "vocab": 3190,
+  "dim": 96,
+  "layers": 3,
+  "state_dim": 8,
+  "moe": false,
+  "keys_proj": false,
+  "gate_bias": -1.0,
+  "aux_copy": true,
+  "batch_size": 8,
+  "lr": 3e-4,
+  "steps": 1400,
+  "seed": 0,
+  "loss": "loss_v33: blend CE + gen CE (gen rows only) + manual -log p copy CE, w_copy=1.0",
+  "decode": "decode_v33: blend argmax, boundary_eos=True (slot-copy task)",
+  "train_data": "pkg000..pkg059 (seen), eval on pkg060..pkg099 (unseen)",
+  "verified": "40/40 unseen blend + hard — see experiments/verified/slot_v33_seed42.py",
+  "tokenizer": "retop_tokenizer.json"
+}

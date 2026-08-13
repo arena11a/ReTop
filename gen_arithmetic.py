@@ -24,6 +24,7 @@ plus a "meta" field for stats / later breakdown.
 """
 
 import argparse
+from paths import ARITHMETIC
 import json
 import os
 import random
@@ -223,8 +224,7 @@ def main():
     ap.add_argument("--val", default=1000, type=int, help="distinct val keys held out per stage")
     ap.add_argument("--seed", default=42, type=int)
     ap.add_argument("--outdir",
-                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "hmn_data", "arithmetic"))
+                    default=ARITHMETIC)
     ap.add_argument("--chunk", default=10000, type=int)
     args = ap.parse_args()
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retop-hmn"
-version = "0.1.0"
+version = "0.2.0"
 description = "Helix Memory Network — reversible coupling + MoE + episodic memory language model (CPU-trainable)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,9 +14,15 @@ dependencies = [
     "tokenizers>=0.13",
 ]
 
+[project.optional-dependencies]
+gui = ["gradio>=4"]
+exps = ["matplotlib", "numpy"]
+
 [project.scripts]
+retop = "retop:main"
 retop-infer = "infer:main"
+retop-gui = "retop_gui:main"
 
 [tool.setuptools]
 packages = ["hmn"]
-py-modules = ["infer"]
+py-modules = ["infer", "retop", "train_v3", "gen_slots", "retop_gui"]

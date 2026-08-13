@@ -17,6 +17,7 @@ Split: deterministic md5 4/5 train / val on the SLOT (not paraphrase), so a give
 slot is fully in one split => val = unseen slots of the same templates.
 """
 import hashlib, json, os, random
+from paths import DISTILL_TEMPLATES
 
 
 # ---------------------------------------------------------------- slot pools
@@ -231,7 +232,7 @@ def build_all():
 
 
 def main():
-    outdir = "hmn_data/distill_templates"
+    outdir = DISTILL_TEMPLATES
     os.makedirs(os.path.join(outdir, "train"), exist_ok=True)
     os.makedirs(os.path.join(outdir, "val"), exist_ok=True)
     records = build_all()

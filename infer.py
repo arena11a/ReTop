@@ -14,16 +14,15 @@ Usage:
 """
 import argparse
 import os
-import random
 
 import torch
 
 from tokenizers import Tokenizer
 
 from hmn import HMN, HMN_Option1, HMN3
+from hmn.recipe import decode_v33, make_chat_ids
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VOCAB = 3190
 EOS = "</s>"
 ASI = "<|assistant|>"
 
@@ -32,39 +31,33 @@ def build_tokenizer(path):
     return Tokenizer.from_file(path)
 
 
-def build_model(arch, args):
+def build_model(arch, args, tok):
+    vocab = tok.get_vocab_size()
     if arch == "v2":
-        return HMN(VOCAB, args.dim, args.state, args.layers,
+        return HMN(vocab, args.dim, args.state, args.layers,
                    n_experts=16, top_k=2,
                    n_mem_cells=args.mem_cells, mem_top_k=4,
                    memory_interval=args.mem_interval)
     if arch == "option1":
-        return HMN_Option1(VOCAB, dim=args.dim, state_dim=args.state,
+        return HMN_Option1(vocab, dim=args.dim, state_dim=args.state,
                            n_layers=args.layers, n_mem_cells=args.mem_cells,
                            mem_top_k=4, beta_init=30.0, usage_decay=True,
                            combined=args.combined, exempt_combined=args.exempt_combined,
                            n_pairs=args.n_pairs, tie_weights=True)
     if arch == "v3":
-        return HMN3(VOCAB, dim=args.dim, state_dim=args.state, n_layers=args.layers,
+        return HMN3(vocab, dim=args.dim, state_dim=args.state, n_layers=args.layers,
                     use_moe=args.moe, gate_bias=args.gate_bias,
                     use_think=args.think, k_max=args.k_max,
-                    asi_id=asi_token_id(args))
+                    asi_id=tok.token_to_id(ASI))
     raise ValueError(f"unknown --arch {arch!r}")
 
 
-def asi_token_id(args):
-    tok = build_tokenizer(args.tok)
-    ids = tok.encode(ASI).ids
-    return ids[0]
-
-
-def encode_chat(tok, user):
-    return tok.encode(f"<s><|user|>{user}<|assistant|>").ids
-
-
-def generate(model, tok, prompt_ids, max_new, seed=0):
+def generate(model, tok, prompt_ids, max_new, arch="v2"):
+    """Greedy decode. v3 uses hmn/recipe.decode_v33 (blend of gen+copy with the
+    boundary rule); legacy v2/option1 use softmax argmax."""
+    if arch == "v3":
+        return decode_v33(model, tok, prompt_ids, max_new)[0]
     ids = list(prompt_ids)
-    rng = random.Random(seed)
     eos = tok.token_to_id(EOS)
     with torch.no_grad():
         for _ in range(max_new):
@@ -104,7 +97,7 @@ def main():
 
     torch.manual_seed(args.seed)
     tok = build_tokenizer(args.tok)
-    model = build_model(args.arch, args)
+    model = build_model(args.arch, args, tok)
     try:
         model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
     except RuntimeError as e:
@@ -125,9 +118,9 @@ def main():
                 break
             if not user:
                 continue
-            print(generate(model, tok, encode_chat(tok, user), args.max_new, args.seed))
+            print(generate(model, tok, make_chat_ids(tok, user), args.max_new, args.arch))
     elif args.prompt:
-        print(generate(model, tok, encode_chat(tok, args.prompt), args.max_new, args.seed))
+        print(generate(model, tok, make_chat_ids(tok, args.prompt), args.max_new, args.arch))
     else:
         ap.error("need --prompt or --interactive")
 

@@ -13,6 +13,7 @@ Eval (Step 5) runs the eval protocol from distill_design.md:
 Baseline teacher val score (metadata): syntax 9/9, api 17/17, run 6/6 (100%).
 """
 import argparse, ast, json, os, random, subprocess, sys, time
+from paths import DISTILL_TEMPLATES
 import torch
 import torch.nn as nn
 from tokenizers import Tokenizer
@@ -21,7 +22,7 @@ from hmn import HMN
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VOCAB_SIZE = 3190
 TOKENIZER_PATH = os.path.join(ROOT, "retop_tokenizer.json")
-DATA_ROOT = os.path.join(ROOT, "hmn_data", "distill_templates")
+DATA_ROOT = DISTILL_TEMPLATES
 
 
 def build_tokenizer():

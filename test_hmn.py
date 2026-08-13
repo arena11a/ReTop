@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tokenizers import Tokenizer
+
 from hmn import (
     HMN,
     HMN_Option1,
@@ -26,7 +28,9 @@ from hmn import (
     ReversibleFunction,
     SparseConditionalCompute,
 )
+from hmn.recipe import decode_v33, loss_v33, make_chat_ids
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
 VOCAB = 3190
 DIM = 64
 
@@ -126,13 +130,17 @@ def test_v3_forward_and_copy():
     # copy_dist is a probability distribution over vocab
     check(torch.allclose(out["copy_dist"].sum(-1), torch.ones(2, 16), atol=1e-3),
           "copy_dist sums to 1 per position")
-    # backward incl. aux copy loss
-    lossf = nn.CrossEntropyLoss()
-    loss = lossf(out["logits"].reshape(-1, VOCAB), rand_ids().reshape(-1)) \
-        + lossf(out["copy_dist"].reshape(-1, VOCAB), rand_ids().reshape(-1))
+    # backward incl. aux copy loss (via the v3.3 recipe, NOT CE-on-probs)
+    Y = rand_ids()
+    Yc = Y.clone()
+    Yc[:, 0] = -100
+    G = torch.ones_like(Y, dtype=torch.float)
+    G[:, 0] = 0.0
+    loss, l_blend, l_gen, l_copy = loss_v33(out, Y, Yc, G)
     loss.backward()
     n_grad = sum(1 for p in m.parameters() if p.grad is not None)
     check(n_grad > 0, f"gradients reached {n_grad} params")
+    check(torch.isfinite(loss), "loss_v33 finite")
 
 
 def test_v3_noreg_and_think():
@@ -158,6 +166,75 @@ def test_moe_aux_loss():
     check(a.numel() == 1, "HMN.moe_aux_loss() scalar")
 
 
+def test_recipe_copy_ce_is_manual_logp():
+    print("[recipe copy CE is manual -log p (NOT CE-on-probs)]")
+    vocab = 32
+    bs, t = 2, 8
+    torch.manual_seed(0)
+    cp_logits = torch.randn(bs, t, vocab)
+    copy_dist = cp_logits.softmax(-1)  # already a probability distribution
+    Yc = torch.randint(0, vocab, (bs, t)).long()
+    Yc[0, 0] = -100
+    Yc[1, 1] = -100
+    Y = Yc.clone()
+    G = torch.ones(bs, t)
+    G[0, 0] = G[1, 1] = 0.0
+    out = {"logits": cp_logits,
+           "gen_logits": cp_logits.log_softmax(-1),
+           "copy_dist": copy_dist}
+    loss, lb, lg, lc = loss_v33(out, Y, Yc, G)
+    mask = Yc != -100
+    manual = -(copy_dist[mask].gather(1, Yc[mask].unsqueeze(1)).squeeze(-1)).log().mean()
+    check(torch.allclose(lc, manual, atol=1e-6),
+          f"copy CE == -log p_target ({lc.item():.4f} vs manual {manual.item():.4f})")
+    buggy = F.cross_entropy(copy_dist.reshape(-1, vocab), Yc.reshape(-1), ignore_index=-100)
+    check(not torch.allclose(lc, buggy, atol=0.5),
+          f"copy CE is NOT CE-on-probs ({lc.item():.4f} vs buggy {buggy.item():.4f})")
+
+
+def test_recipe_chat_ids_no_special_split():
+    print("[recipe make_chat_ids: chat specials stay single ids]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asid = tok.token_to_id("<|assistant|>")
+    eos = tok.token_to_id("</s>")
+    ids = make_chat_ids(tok, "pip install pkg042")
+    check(ids[0] == tok.token_to_id("<s>"), "<s> single id")
+    check(ids[1] == tok.token_to_id("<|user|>"), "<|user|> single id")
+    check(ids.count(asid) == 1, "<|assistant|> present exactly once")
+    check(eos not in ids, "no </s> without a gold answer")
+    full = make_chat_ids(tok, "pip install pkg042", "pip install pkg042")
+    check(full.count(eos) == 1, "</s> present exactly once with gold")
+    check(ids.index(asid) == 2 + len(tok.encode("pip install pkg042").ids),
+          "<|assistant|> lands exactly after the encoded user text")
+    a = full.index(asid)
+    check(tok.decode(full[a + 1:]) == "pip install pkg042", "answer region decodes to gold")
+
+
+def test_recipe_decode_boundary_rule():
+    print("[recipe decode_v33 boundary_eos forces EOS on low gate]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    vocab = tok.get_vocab_size()
+    bad = 42  # a non-EOS id the dummy model keeps argmaxing
+
+    class Dummy(nn.Module):
+        def forward(self, x):
+            T = x.shape[1]
+            logits = torch.zeros(1, T, vocab)
+            logits[0, -1, bad] = 10.0
+            return {"logits": logits,
+                    "gen_logits": logits.log_softmax(-1),
+                    "copy_dist": logits.softmax(-1),
+                    "g": torch.zeros(1, T).fill_(0.1)}
+
+    prompt = make_chat_ids(tok, "pip install pkg042")
+    m = Dummy()
+    ob, _, _ = decode_v33(m, tok, prompt, max_new=8, boundary_eos=True)
+    onb, _, _ = decode_v33(m, tok, prompt, max_new=8, boundary_eos=False)
+    check(ob != "", "boundary decode still emits the first answer token")
+    check(len(ob) < len(onb),
+          f"boundary rule stops early ({ob!r} -> {len(ob)} chars vs no-boundary {len(onb)} chars)")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_v2_forward_backward()
@@ -167,4 +244,7 @@ if __name__ == "__main__":
     test_v3_forward_and_copy()
     test_v3_noreg_and_think()
     test_moe_aux_loss()
+    test_recipe_copy_ce_is_manual_logp()
+    test_recipe_chat_ids_no_special_split()
+    test_recipe_decode_boundary_rule()
     print("\nALL TESTS PASSED")

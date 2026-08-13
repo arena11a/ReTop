@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+from paths import ARITHMETIC
 import itertools
 import json
 import os
@@ -26,7 +27,7 @@ from hmn import HMN
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VOCAB_SIZE = 3190
 DEFAULT_TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
-DEFAULT_DATA = os.path.join(ROOT, "hmn_data", "arithmetic")
+DEFAULT_DATA = ARITHMETIC
 
 
 def build_tokenizer():

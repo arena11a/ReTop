@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+from paths import RECALL
 import os
 import random
 import sys
@@ -28,7 +29,7 @@ def build_tokenizer():
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOKENIZER_PATH = os.path.join(ROOT, "retop_tokenizer.json")
-DATA_ROOT = os.path.join(ROOT, "hmn_data", "recall")
+DATA_ROOT = RECALL
 VOCAB_SIZE = 3190
 EOS_ID = 1
 PAD_ID = 3
