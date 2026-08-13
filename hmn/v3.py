@@ -121,9 +121,10 @@ class IdentityRegister(nn.Module):
                 # not by what the gen head memorized.
                 #
                 # v4 M2-dev N-gram: the anchor extends BEYOND row 0, keyed by
-                # stem position. Answer row t (a = ASI row) is anchored onto
-                # user-region column u+1+(t-a) — a deterministic positional
-                # echo of the template prefix. This is what resolves repeated
+                # stem position. Answer row a+i is anchored onto user-region
+                # column u+i — a deterministic positional echo of the template
+                # prefix (payload ids[j+1] = ids[u+i+1] = gold token i). This
+                # is what resolves repeated
                 # subtokens (e.g. "check" -> c,he,c,k): raw identity on the
                 # seed 'c' ties col2 (c->he) vs col4 (c->k), but the positional
                 # anchor picks col3=he unambiguously. Rows beyond the user
