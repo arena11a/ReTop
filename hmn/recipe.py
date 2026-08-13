@@ -145,7 +145,7 @@ def copy_prob_sparse(attn, nxt, targets):
     return (attn * eq.float()).sum(-1)                          # (B,T)
 
 
-def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0):
+def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
     """v3.3 loss = blend CE + w_copy*gen CE (masked) + w_copy*copy CE (manual).
 
     out must be HMN3.forward's dict: {"logits", "gen_logits", "copy_dist", ...}.
@@ -192,6 +192,14 @@ def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0):
         else:
             l_copy = torch.zeros((), device=out["logits"].device)
     loss = l_blend + w_copy * l_gen + w_copy * l_copy
+    if w_gate > 0.0:
+        # v4 M2: supervise the learned gate DIRECTLY against the copy mask G.
+        # G==-1 rows (prompt/ASI) carry no copy target — mask them out.
+        vm = G.reshape(-1) >= 0.0
+        if vm.any():
+            l_gate = nn.functional.binary_cross_entropy(
+                out["g"].reshape(-1)[vm], (G.reshape(-1)[vm] > 0.5).float())
+            loss = loss + w_gate * l_gate
     return loss, l_blend, l_gen, l_copy
 
 

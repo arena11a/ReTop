@@ -160,7 +160,7 @@ class DualHeadDecoder(nn.Module):
     via a different mechanism (see identity-register postmortem).
     """
 
-    def __init__(self, dim, vocab, tie_embed=None, gate_bias=0.0):
+    def __init__(self, dim, vocab, tie_embed=None, gate_bias=0.0, gate=None):
         super().__init__()
         # gen takes [h, gate_mass, behind] (dim+2): the two extra channels are a
         # DIRECT boundary signal. At the last answer row gate_mass collapses to
@@ -171,10 +171,21 @@ class DualHeadDecoder(nn.Module):
         self.gen = nn.Linear(dim + 2, vocab, bias=False)
         self.gate_bias = gate_bias
         self.tau = nn.Parameter(torch.tensor(12.0))
+        # v4 M2: pluggable learned gate (RelativeGate); None keeps the
+        # deterministic same-token-id gate that is v3.3-final.
+        self.gate = gate
         if tie_embed is not None:
             # tie only the h-cols (embed is dim-wide); the two extra boundary
             # channels stay free.
             self.gen.weight.data[:, :dim] = tie_embed.detach()
+
+    def gen_probs(self, h, gate_mass, behind):
+        """Conditioned gen distribution for external logging/aux CE. Mirrors
+        forward() so HMN3.forward's gen_logits uses the SAME [h,gm,behind]
+        input the blend does (otherwise the aux CE trains a different head)."""
+        b = behind.unsqueeze(-1).float()
+        gm = gate_mass.unsqueeze(-1)
+        return torch.log_softmax(self.gen(torch.cat([h, gm, b], -1)), -1)
 
     def forward(self, h, copy_logits, ctx, attn=None, n_legal=None, behind=None,
                 gate_mass=None, eps=1e-8, sparse=False, nxt=None):
@@ -182,11 +193,19 @@ class DualHeadDecoder(nn.Module):
             b = behind.unsqueeze(-1).float()
             gm = gate_mass.unsqueeze(-1)
             gen = torch.log_softmax(self.gen(torch.cat([h, gm, b], -1)), -1)
-            # deterministic same-token-id gate (see class docstring).
-            # threshold 0.5 fixed: exact twin ~0.99, boundary ~0.
-            g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - 0.5))
-                              .clamp(-6.0, 6.0))
-            g = g * (1.0 - b)                      # prompt/ASI rows: gen
+            if self.gate is not None:
+                # v4 M2 relative gate: gen_margin = top1-top2 log prob =
+                # the gen head's own confidence. Detached so the gate learns
+                # to READ confidence without warping the gen head's gradient.
+                top2 = gen.topk(2, dim=-1)
+                margin = (top2[0][..., 0] - top2[0][..., 1]).detach()
+                g = self.gate(h, gate_mass, margin, behind, n_legal)
+            else:
+                # deterministic same-token-id gate (see class docstring).
+                # threshold 0.5 fixed: exact twin ~0.99, boundary ~0.
+                g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - 0.5))
+                                  .clamp(-6.0, 6.0))
+                g = g * (1.0 - b)                      # prompt/ASI rows: gen
         else:
             # legacy path (no attn provided): fall back to a static open gate
             gen = torch.log_softmax(self.gen(
@@ -211,13 +230,47 @@ class DualHeadDecoder(nn.Module):
         p = (1 - g) * gen.exp() + g * copy_dist
         return torch.log(p.clamp(min=eps)), g
 
-    def gen_probs(self, h, gate_mass, behind):
-        """Conditioned gen distribution for external logging/aux CE. Mirrors
-        forward() so HMN3.forward's gen_logits uses the SAME [h,gm,behind]
-        input the blend does (otherwise the aux CE trains a different head)."""
-        b = behind.unsqueeze(-1).float()
-        gm = gate_mass.unsqueeze(-1)
-        return torch.log_softmax(self.gen(torch.cat([h, gm, b], -1)), -1)
+
+class RelativeGate(nn.Module):
+    """v4 M2: LEARNED copy gate on the register statistics, supervised directly
+    against the copy-mask G (BCE). The v3.1 learned gate (Linear[h,ctx] ->
+    sigmoid) collapsed to ~0.05 because it was trained only through the blend CE
+    — a free-running scalar had no pressure to discriminate copy vs gen rows.
+    Here g is trained with an explicit target (G==1 rows should open copy,
+    G==0 rows should close it), and it sees the same-token-id mass PLUS the
+    counter-signal v3.1 lacked:
+
+        gen_margin = gen top-1 minus top-2 log prob. High gen margin means the
+        gen head is already confident, so copy is not needed (it would only
+        overwrite a correct prediction with a memorized twin); low margin means
+        gen is unsure and an exact in-prompt twin is the reliable lane.
+
+    Input channels: [h, gate_mass, gen_margin, behind, n_legal_norm].
+    Deterministic gate stays the DEFAULT; this module only swaps it in when
+    HMN3(gate_mode="relative")."""
+
+    def __init__(self, dim, gate_bias=0.0):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim + 4, dim + 4),
+            nn.SiLU(),
+            nn.Linear(dim + 4, 1),
+        )
+        self.bias = nn.Parameter(torch.tensor(float(gate_bias)), requires_grad=False)
+
+    def forward(self, h, gate_mass, gen_margin, behind, n_legal):
+        x = torch.cat([h.float(),
+                       gate_mass.unsqueeze(-1),
+                       gen_margin.unsqueeze(-1),
+                       behind.unsqueeze(-1).float(),
+                       (n_legal.float().clamp(min=0) / 2.0).unsqueeze(-1)], -1)
+        # v4 M2b: NO forced (1-behind) mask — unlike the deterministic gate
+        # (v3.3), which needs it because it has no confidence signal, the
+        # relative gate watches gen_margin itself and can decide row 0 (the
+        # template verb) independently. That is precisely the unseen-template
+        # failure M3 measured (gen emits a *seen* verb like 'pip' for probes).
+        g = torch.sigmoid(self.mlp(x) + self.bias)
+        return g
 
 
 class LatentThinkingBuffer(nn.Module):
@@ -259,7 +312,7 @@ class HMN3(nn.Module):
     def __init__(self, vocab_size, dim=96, state_dim=8, n_layers=3, n_experts=16,
                  top_k=2, use_moe=False, use_think=False, k_max=4, tie_weights=True,
                  gate_bias=0.0, aux_copy=True, asi_id=None, keys_proj=False,
-                 sparse_marginal=False):
+                 sparse_marginal=False, gate_mode="deterministic"):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
@@ -272,9 +325,12 @@ class HMN3(nn.Module):
             for _ in range(n_layers)])
         self.ir = IdentityRegister(dim, asi_id=asi_id, keys_proj=keys_proj)
         self.ir.set_vocab(vocab_size)
+        # v4 M2: pluggable gate — deterministic stays default (v3.3-final),
+        # RelativeGate is the learned alternative supervised by the copy mask.
+        gate = RelativeGate(dim, gate_bias) if gate_mode == "relative" else None
         self.dual = DualHeadDecoder(dim, vocab_size,
                                     tie_embed=self.embed.weight if tie_weights else None,
-                                    gate_bias=gate_bias)
+                                    gate_bias=gate_bias, gate=gate)
         self.use_think = use_think
         self.think = LatentThinkingBuffer(dim, k_max) if use_think else None
         self.aux_copy = aux_copy

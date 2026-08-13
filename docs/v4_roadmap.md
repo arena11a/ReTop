@@ -98,7 +98,8 @@ Not chased early. Comes after smart.
 | M0 | Baseline + doc | branch v4, this doc, verify v3.3 | `docs/` | 40/40 + ALL TESTS |
 | M1 | Sparse marginal | IR mass `(B,T,V)->` position-gather; loss reads (attn,nxt) | `hmn/v3.py`, `recipe.py` | **DONE**: parity 0.000e+00, 40/40 kept |
 | M3 | Multi-template | curriculum batch | `recipe.py`, `train_v3.py`, `gen_slots.py` | **PARTIAL**: trained templates -> 4/4 at 1.000 (import/run/apt went 0/40 -> 40/40); never-seen probes still 0.000 -> M2 relative gate is REQUIRED, confirmed |
-| M2 | Relative gate | learned gate w/ gen_margin | `hmn/v3.py` | template probes up |
+| M2 | Relative gate | learned gate w/ gen_margin | `hmn/v3.py` | structure DONE; **finding**: gate learns & doesn't collapse (0.4-0.78 vs v3.1's 0.05) but row-0 subword off-by-one is the real unseen-template blocker -> M3b (see §6) |
+| M3b | _new_ Template pooling | train on many verbs, probe held-out verbs | `train_v3.py` | 10 trained verbs -> all 1.000; held-out verb (mount/uninstall/clean/check) still 0.000 at gate 0.001 |
 | M4 | Think D1 | wire + validate on multi-step | `retop.py`, `train_v3.py`, `gen_chat.py` | thinking > no-thinking on multi-step |
 | M5 | GPU spec | silver/gold + MoE@large | `retop.py` | val good, no crash |
 | M6 | Think D2 | latent-slot (if M4 wins) | `hmn/v3.py`, `recipe.py` | beats D1 |
@@ -154,3 +155,15 @@ added from external review feedback.
   drift.
 - MoE gain at high D: enable only if it measurably helps val on GPU.
 - Multi-template curriculum order: fixed order vs temperature-sampled mix.
+- **M2/M3b finding (2026-08-13)**: the real unseen-template blocker is NOT the
+  gate (the relative gate learns and stays open on probes, unlike deterministic
+  gate at 0.001) — it is the **first answer token**: the copy lane is a
+  next-token lookup (payload = ids[j+1]), and on the seed row the query
+  self-matches the FIRST subtoken of the template verb ('re' in 'remove'),
+  emitting the NEXT subtoken ('mo'). So row-0 can only be produced by the gen
+  head, and gen is lexically bound to seen verbs no matter how many templates
+  are pooled. Options to unblock: (a) make the register addressable by the
+  whole matched stem, not just one token id; (b) train the gen head on a
+  template-start distribution that is open-vocabulary. Both are M2-dev follow-
+  ups; the immediate lever already measured is verb pooling helping every
+  SEEN verb but none held out (template-bound copy persists).

@@ -64,7 +64,7 @@ def build_model(arch, args, tok):
     return HMN3(vocab, dim=args.dim, state_dim=8, n_layers=args.layers,
                 use_moe=args.moe, gate_bias=args.gate_bias, asi_id=asi_id(tok),
                 keys_proj=args.keys_proj, aux_copy=(arch == "v31"),
-                sparse_marginal=args.sparse_marginal)
+                sparse_marginal=args.sparse_marginal, gate_mode=args.gate_mode)
 
 
 def main():
@@ -80,7 +80,12 @@ def main():
     ap.add_argument("--gate-bias", type=float, default=-1.0)
     ap.add_argument("--w-copy", type=float, default=1.0, help="weight on copy+gen aux CE")
     ap.add_argument("--w-ptr", type=float, default=1.0, help="(vestigial) pointer CE weight")
-    ap.add_argument("--w-gate", type=float, default=0.5, help="(vestigial) gate BCE weight")
+    ap.add_argument("--w-gate", type=float, default=0.0,
+                    help="v4 M2: BCE weight supervising a LEARNED gate against the copy mask "
+                         "(default 0 = deterministic gate, no extra loss)")
+    ap.add_argument("--gate-mode", default="deterministic", choices=["deterministic", "relative"],
+                    help="v4 M2: deterministic same-token-id gate (default, v3.3-final) or the "
+                         "learned RelativeGate ([h, gate_mass, gen_margin, behind, n_legal])")
     ap.add_argument("--moe", action="store_true")
     ap.add_argument("--keys-proj", action="store_true")
     ap.add_argument("--eval-every", type=int, default=250)
@@ -95,9 +100,13 @@ def main():
     args = ap.parse_args()
 
     tpls = [DEFAULT_TEMPLATE] if not args.templates else args.templates.split("|")
-    PROBE_TEMPLATES = [  # NEVER trained, regardless of --templates — generalizes?
-        "remove {slot}", "delete {slot}", "get {slot}",
+    ALL_TEMPLATES = [  # the full pool; probes are chosen from here MINUS trained
+        "pip install {slot}", "import {slot}", "run {slot}", "apt install {slot}",
+        "remove {slot}", "delete {slot}", "get {slot}", "cache {slot}",
+        "fetch {slot}", "pip uninstall {slot}", "mount {slot}", "uninstall {slot}",
+        "clean {slot}", "check {slot}", "search {slot}",
     ]
+    PROBE_TEMPLATES = [t for t in ALL_TEMPLATES if t not in tpls][:4]
 
     seed_guardrail(args.seed)
     tok = build_tok()
@@ -117,7 +126,8 @@ def main():
         out = model(X)
         if args.arch == "v31":
             loss, l_blend, l_gen, l_copy = loss_v33(out, Y, Yc, G, lossf=lossf,
-                                                    w_copy=args.w_copy)
+                                                    w_copy=args.w_copy,
+                                                    w_gate=args.w_gate)
         else:
             vocab = out["logits"].shape[-1]
             loss = lossf(out["logits"].reshape(-1, vocab), Y.reshape(-1))
