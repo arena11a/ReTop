@@ -1,8 +1,10 @@
 # Data preparation
 
-`retop.py train` and `train_v3.py` consume the same three on-disk formats. All
-records are encoded on the fly (streaming), so files can be arbitrarily large on
-low-RAM machines.
+`retop.py train` and `train_v3.py` share the same loss/recipe, but their **data
+inputs differ**: `train_v3.py` builds its slot-copy data in-process from
+hardcoded seen/unseen package lists (no file read); `retop.py train` reads the
+on-disk formats below. All records are encoded on the fly (streaming), so files
+can be arbitrarily large on low-RAM machines.
 
 ## 1. Slot-copy chat pairs (.jsonl) — the v3.3 native format
 

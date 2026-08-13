@@ -6,7 +6,7 @@ two lanes separate — one that *thinks* and one that *copies verbatim*.
 
 Its headline result: re-emitting the **exact literal of an UNSEEN token** from
 the prompt, at **40/40** on the canonical slot-copy eval — something a
-single-pass softmax decoder structurally cannot do — trained in ~15 minutes on a
+single-pass softmax decoder structurally cannot do — trained in ~7 minutes on a
 4-core CPU with ~4 GB RAM.
 
 ```
@@ -79,33 +79,52 @@ Generalization — measured, honest boundaries (§5 of `docs/hmn_v3_design.md`):
 
 ---
 
-## Quickstart — running in ~5 minutes
+## Quickstart — running in ~8 minutes
 
 Requires Python 3.9+ (tested 3.12), CPU-only PyTorch, `tokenizers`:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
+# Windows: .venv\Scripts\activate  (instead of the line above)
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install tokenizers
-pip install -e .            # optional: import hmn from anywhere
+pip install -e .            # installs the retop / retop-infer / retop-gui commands
 ```
 
-### 1. Verify the shipped checkpoint (guardrail, ~1 min CPU)
+> The `-e .` install is **required**: `train_v3.py`, `gen_slots.py` etc. run from
+> the repo root, but the `retop*` console commands (incl. the GUI) only exist
+> after it. It pulls the `hmn` package into your environment — no GPU needed.
+
+### 1. Verify the shipped checkpoint (guardrail, ~25 s CPU)
 
 ```bash
 python experiments/verified/slot_v33_seed42.py
-#   [PASS] unseen blend 'pip install {slot}': 1.000 (40/40, gate 0.775)
-#   [PASS] unseen hard (gate>0.5 -> copy argmax): 1.000
-#   [PASS] structural variant 'pip install -r {slot}': 1.000
+#   checkpoint: hmn_v33.pt (664,270 params, cfg=...)
+#   [PASS] unseen blend + boundary_eos 'pip install {slot}': 40/40
+#   [PASS] unseen hard (gate>0.5 -> copy argmax):    40/40
+#   [PASS] structural variant 'pip install -r {slot}': 40/40
+#   ...
 #   ALL GUARDS PASSED
 ```
 
-### 2. Train your own slot-copy model
+The script prints a table per probe (`ok/total`) and exits with `ALL GUARDS
+PASSED` or `GUARDRAIL FAILED`. Use `--checkpoint PATH` to evaluate another
+checkpoint (e.g. your own `my_slots.pt`).
+
+### 2. Train your own slot-copy model (~7 min CPU, 4-core)
+
+`train_v3.py` builds its **own** slot data in-process (60 seen pkg000..059,
+40 unseen pkg060..099, deterministic per seed) — it does *not* read
+`data/slots.jsonl`. `gen_slots.py` exists to write slot-copy files for
+`retop.py train` and for inspecting/eval splits (§ Training on your own data).
 
 ```bash
-python gen_slots.py --out data/slots.jsonl --n-seen 600 --n-unseen 400 --seed 0
-python train_v3.py --steps 1400 --arch v31 --save hmn_v33.pt    # ~15 min CPU
+python train_v3.py --steps 1400 --arch v31 --save my_slots.pt   # ~7 min CPU
 ```
+
+> Quote the seed if you want bit-for-bit reproducibility: `--seed 0` (default)
+> is the canonical v3.3 run. Save to a **new** filename — `hmn_v33.pt` is the
+> shipped, guardrail-verified checkpoint and should stay untouched.
 
 ### 3. Chat with a checkpoint
 
@@ -117,7 +136,9 @@ python infer.py --checkpoint hmn_v33.pt --arch v3 --dim 96 --layers 3 \
 ```
 
 > Checkpoints are `model.state_dict()`; `infer.py` prints a clear error if the
-> `--arch` / hyperparameters don't match.
+> `--arch` / hyperparameters don't match. The shipped checkpoint is
+> v3 / D96 / L3 / gate-bias −1.0 — passing those flags with `hmn_v33.pt` just
+> confirms the config, it does not change the model.
 
 ### 4. Web UI (Gradio)
 
@@ -127,15 +148,16 @@ stop button, SVG chart), **CHAT** (load checkpoint + decode), **VERIFY**
 drifts from the CLI.
 
 ```bash
-pip install "gradio>=4"
-retop-gui                          # opens http://127.0.0.1:7860
+pip install "gradio>=4"     # or: pip install -e ".[gui]" (adds gradio + numpy)
+retop-gui                   # requires the `pip install -e .` step above
+                            # opens http://127.0.0.1:7860
 ```
 
 ---
 
 ## Training on your own data
 
-### Generate bilingual-free corpora with `gen_chat.py`
+### Generate corpora with `gen_chat.py`
 
 `gen_chat.py` streams combinatorial chat-pairs up to a target token budget
 (~4 chars/token heuristic), deterministic per `--seed`:

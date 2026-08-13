@@ -96,8 +96,8 @@ files.
 ## 3. Verified numbers
 
 Config: D96/L3, state_dim 8, gate_bias −1.0, `w_copy` 1.0, batch 8, lr 3e-4,
-1400 steps, seed 0, CPU (~15 min). Train = `pip install pkg000..059`; eval =
-`pkg060..099`, zero overlap (`gen_slots.py` guarantees the disjoint split).
+1400 steps, seed 0, CPU (~7 min). Train = `pip install pkg000..059`; eval =
+`pkg060..099`, zero overlap (in-process split).
 
 Run `python experiments/verified/slot_v33_seed42.py`.
 
@@ -175,9 +175,16 @@ Section 5 is updated from the guardrail — run
 
 ## 7. Reproducing
 
+`train_v3.py` builds its slot data in-process (PKGS_SEEN 60 / PKGS_UNSEEN 40,
+deterministic per seed) — it does **not** read a `slots.jsonl` file. To get the
+canonical run, use the default seed and a fresh save path:
+
 ```bash
-python gen_slots.py --out data/slots.jsonl --n-seen 600 --n-unseen 400 --seed 0
-python train_v3.py --steps 1400 --arch v31 --save hmn_v33.pt
-python experiments/verified/slot_v33_seed42.py            # asserts 40/40
+python train_v3.py --steps 1400 --arch v31 --save my_slots.pt   # ~7 min CPU
+python experiments/verified/slot_v33_seed42.py --checkpoint my_slots.pt   # 40/40
 python test_hmn.py                                        # recipe guardrails
 ```
+
+`gen_slots.py` is for writing slot-copy `.jsonl` files consumed by
+`retop.py train` and for inspecting the seen/unseen split — not required for
+this pipeline.
