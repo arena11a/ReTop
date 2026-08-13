@@ -18,6 +18,9 @@ chunked, never loaded fully into memory.
 
 ## Why a split-channel architecture?
 
+> Non-technical? Start with the plain-language review:
+> [`docs/architecture_review.md`](docs/architecture_review.md).
+
 Standard LLMs are single-pass probabilistic generators: one forward → softmax →
 sample. This repo's own experiments verified three hard ceilings of that design
 (`docs/task1_findings.md`, `docs/task2_findings.md`, `docs/distill_design.md`):
