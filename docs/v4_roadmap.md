@@ -105,7 +105,7 @@ Not chased early. Comes after smart.
 | M5 | GPU spec | silver/gold + MoE@large | `retop.py` | val good, no crash |
 | M6 | Think D2 | latent-slot (if M4 wins) | `hmn/v3.py`, `recipe.py` | beats D1 |
 | M7 | GUI v4 | toggles + v4 verify matrix | `retop_gui.py` | think/spec toggle usable |
-| M8 | **Baseline** | HMN vs vanilla transformer & HMN3_NoReg, same size, same task | `experiments/` | quantify dual-register edge, honest README |
+| M8 | **Baseline** | HMN vs vanilla transformer & HMN3_NoReg, same size, same task | `experiments/v4/m8_baseline.py` | **DONE (2026-08-13)**: HMN3 664K = 1.000/1.000 (trained/probe); vanilla 667K = 0.000 (fits SEEN slots 1.0 by rote, memorizes unseen ids pkg099->pkg049); HMN3_NoReg 342K = 0.000. Copy pointer is required — softmax cannot re-emit unseen prompt tokens |
 | M9 | **CI** | GitHub Actions: guardrail + tests on every push | `.github/workflows/` | green on push |
 | M10 | Docs v4 | design doc, v4 guardrail, README | `docs/`, `experiments/verified/` | v4 guardrail pass + v3.3 still pass |
 | later | Server | streaming + OpenAI-style endpoint | new | — |
@@ -219,5 +219,14 @@ added from external review feedback.
   across eval seeds 9/11/13/17/21. think was 0.950; stem-addr now matches/exceeds
   it WITHOUT the latent buffer — the anchor is a strictly cheaper fix for the
   row-0 addressing problem (compute scaling buys less than fixing the address).
+- **M8 finding (2026-08-13)**: same-size baseline closes the loop on the
+  original "softmax cannot" claim with real numbers. vanilla transformer
+  (667K, same dim/layers as HMN3 664K, tied embed, pre-LN, greedy argmax): hits
+  1.0 on SEEN slots but 0.0 on UNSEEN slots and 0.0 on every probe template —
+  it rote-fits the training pairs (unseen pkg099 was decoded as memorized
+  pkg049). HMN3_NoReg (342K, register removed) = 0.0 everywhere. HMN3 +
+  stem-addr = 1.0 on trained AND never-seen probes. The copy lane is not an
+  optimization nicety: it is the only component that can re-emit an unseen
+  prompt token. README can now state this with evidence.
   Residual fails are model-level (lib0 subtoken truncation comes from the
   same-lookups, no-think row-0 gate collapse), not decoder plumbing.
