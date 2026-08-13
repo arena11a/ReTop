@@ -1,0 +1,10 @@
+# Normalize line endings for text files (cross-platform friendliness)
+* text=auto eol=lf
+
+# Binary / model artifacts (never diff these)
+*.pt binary
+*.pth binary
+*.ckpt binary
+
+# Large un-diffable artifacts
+retop_tokenizer.json binary -text

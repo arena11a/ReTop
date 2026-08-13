@@ -10,7 +10,7 @@
 ## 1. The problem that motivated v3
 
 The v2 family (reversible coupling + MoE + episodic memory) recalled key→value
-tokens at 97–99% (`legacy/docs/task2_findings.md`), but hit a hard wall on
+tokens at 97–99% (verified single-token recall), but hit a hard wall on
 **slot-copy**:
 
 ```
@@ -26,7 +26,7 @@ with *unseen* slots (`pkg060..pkg099`, never in training) the softmax head score
 > embeddings to have been pushed by gradient — which never happened for the exact
 > digit sequence, because distinct 3-digit suffixes are combinatorially rare.
 > The head can only emit a *blurred average* of "some pkg-suffix", never the
-> exact literal (measured: `pip slot ผิด 100% val`, distillation attempt 3).
+> exact literal (measured: 100% wrong on val in the distillation attempt 3).
 
 **v3's thesis:** separate the answer into two channels and let a learned gate
 route per token — *copy the prompt's exact tokens*, *generate the rest*.

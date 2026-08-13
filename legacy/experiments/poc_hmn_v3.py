@@ -17,7 +17,7 @@ from hmn_v3 import HMN3, HMN3_NoReg
 from hmn_v2 import HMN
 
 VOCAB = 3190
-TOKENIZER_PATH = "/home/yonoob/projects/ReTop/retop_tokenizer.json"
+TOKENIZER_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "retop_tokenizer.json")
 EOS = "</s>"
 ASI = "<|assistant|>"
 

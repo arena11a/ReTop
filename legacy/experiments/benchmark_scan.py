@@ -4,7 +4,8 @@ Configs from doc 16.1: dim64/4L/bs6, dim96/6L/bs8, dim128/8L/bs8.
 Also measures SelectiveSSM pure-scan time (the target of the optimization).
 """
 import sys, time, torch
-sys.path.insert(0, '/home/yonoob/projects/ReTop')
+import os
+sys.path.insert(0, os.path.join(*([os.path.dirname(os.path.abspath(__file__))] + ['..']*2)))
 import torch.nn as nn
 from hmn_v2 import HMN, HelixCouplingBlock, ReversibleFunction
 

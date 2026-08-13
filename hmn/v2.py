@@ -8,7 +8,7 @@ Components:
   - DifferentiableEpisodicMemory (key_proj(prev)/val_proj(cur) split, soft DNC write/read)
   - HMN (embed + L reversible coupling blocks + MoE + memory + head)
 
-Source of truth: Helix-Memory-Network-v2.1.md (pseudocode 10.1-10.3) + validated results
+Source of truth: the v2 concept doc (pseudocode 10.1-10.3) + validated results
 in section 18 (Pre-LN default, aux load-balancing loss, key/val projection split).
 """
 
@@ -346,7 +346,7 @@ class HMN(nn.Module):
 
 
 class HMN_Option1(nn.Module):
-    """HMN v2.2 Option-1 architecture (verified 2026-08-07, task2_findings.md #10-11).
+    """HMN v2.2 Option-1 architecture (verified 2026-08-07, single/multi-token recall 97-99%/94-97%).
 
     Memory reads RAW token embeddings (parallel branch) instead of backbone hidden
     states. Content addressing keeps token identity (backbone SSM makes hidden states

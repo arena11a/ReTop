@@ -1,5 +1,6 @@
 import sys, torch, random
-sys.path.insert(0,'/home/yonoob/projects/ReTop')
+import os
+sys.path.insert(0, os.path.join(*([os.path.dirname(os.path.abspath(__file__))] + ['..']*2)))
 import torch.nn as nn, torch.nn.functional as F
 from hmn_v2 import HelixCouplingBlock, ReversibleFunction
 VOCAB=120; N=8; KEY=(0,50); TENS=(50,60); ONES=(60,70); MARKER=100
