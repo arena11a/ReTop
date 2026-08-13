@@ -47,6 +47,7 @@ from hmn.recipe import (CHAIN_SLOTS_A, CHAIN_SLOTS_A_U, CHAIN_SLOTS_B,
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOS = "</s>"
 ASI = "<|assistant|>"
+USER = "<|user|>"
 
 PKGS_SEEN = [f"pkg{i:03d}" for i in range(60)]
 PKGS_UNSEEN = [f"pkg{i:03d}" for i in range(60, 100)]
@@ -60,6 +61,10 @@ def asi_id(tok):
     return tok.token_to_id(ASI)
 
 
+def user_id(tok):
+    return tok.token_to_id(USER)
+
+
 def build_model(arch, args, tok):
     vocab = tok.get_vocab_size()
     if arch == "noreg":
@@ -68,7 +73,8 @@ def build_model(arch, args, tok):
                 use_moe=args.moe, gate_bias=args.gate_bias, asi_id=asi_id(tok),
                 keys_proj=args.keys_proj, aux_copy=(arch == "v31"),
                 sparse_marginal=args.sparse_marginal, gate_mode=args.gate_mode,
-                use_think=args.use_think, k_max=args.k_max)
+                use_think=args.use_think, k_max=args.k_max, user_id=user_id(tok),
+                stem_addr=args.stem_addr)
 
 
 def main():
@@ -98,6 +104,10 @@ def main():
     ap.add_argument("--task", default="slot", choices=["slot", "chain"],
                     help="v4 M4: slot = single-template copy (default); chain = two-slot "
                          "multi-step task (fetch {a} and deploy {b})")
+    ap.add_argument("--stem-addr", action="store_true",
+                    help="v4 M2-dev: stem-addressing — anchor the ASI boundary row's copy "
+                         "attention onto the USER column so the template's first token is "
+                         "copyable (row-0 no longer forced through gen). Default off = v3.3")
     ap.add_argument("--moe", action="store_true")
     ap.add_argument("--keys-proj", action="store_true")
     ap.add_argument("--eval-every", type=int, default=250)
@@ -133,10 +143,11 @@ def main():
 
     for step in range(1, args.steps + 1):
         if args.task == "chain":
-            X, Y, Yc, G = make_slot_chain_batch(tok, args.bs, step)
+            X, Y, Yc, G = make_slot_chain_batch(tok, args.bs, step,
+                                                stem_row0=args.stem_addr)
         else:
             X, Y, Yc, G = make_slot_batch(tok, PKGS_SEEN, args.bs, step,
-                                          templates=tpls)
+                                          templates=tpls, stem_row0=args.stem_addr)
         opt.zero_grad()
         out = model(X)
         if args.arch == "v31":

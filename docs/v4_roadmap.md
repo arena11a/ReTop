@@ -187,5 +187,37 @@ added from external review feedback.
   fires. Player plot: a 1-token (prev,next) cycle detector is a false
   positive (segments legitimately share tokens like '0'/'9'), but a 2-token
   window is unique per true answer and breaks the loop deterministically.
+- **M2-dev design probe (2026-08-13)**: measured row-0 attention on 30
+  template/slot combos: the ASI row's attention does NOT look at the template
+  start (it peaks on the slot digits, 30/30 mismatch with the payload the
+  answer needs). Row-0 copy cannot be enabled by just un-masking loss rows —
+  the attention was never trained to anchor on the template prefix. Two viable
+  designs: (i) stem-addressing: row-0 query = functional of the template
+  prefix `ids[2:a]` (the whole pre-slot region) instead of raw `ids[a]`,
+  making the register intrinsically address "the answer's first segment";
+  (ii) anchor-copy: force row-0 attention onto the columns whose payload chain
+  completes the template prefix, supervised with a dedicated aux CE. (i) is the
+  user-chosen path (Stem-addressing). Must stay code-guarded behind a flag so
+  v3.3/parity is bit-identical until parity re-check.
+- **M2-dev result (2026-08-13)**: stem-addressing implemented and validated
+  under `--stem-addr` (`hmn/v3.py`, `hmn/recipe.py`, `train_v3.py`). Anchor the
+  ASI row's copy attention onto the USER column -> row-0 payload becomes the
+  template's first token (deterministic gate opens, no more forced gen). M3b's
+  never-seen probes went from 0.000 to 1.000 for mount/uninstall/clean after
+  600 steps — the first template-general row-0 fix. `check` (BPE c,he,c,k)
+  still failed: the seed 'c' matched BOTH col2 and col4, tying raw-identity
+  attention -> wrong payload. Fixed by extending the anchor beyond row 0 keyed
+  by stem POSITION (answer row a+i -> user col u+i); the repeated-subtoken tie
+  is resolved because the anchor picks the unique positional column, not the
+  ambiguous identity. Result: all 10 trained + 4/4 probes (mount/uninstall/
+  clean/check) at 1.000, gate 0.89. Default OFF -> v3.3/parity untouched
+  (test_hmn + M1 parity + slot_v33_seed42 all green).
+- **M2-dev -> M4 chain (2026-08-13)**: stem-addr applied to the two-slot chain
+  task (`fetch {a} and deploy {b}`, no-think). The row-0 gate collapse that kept
+  no-think at 0.925 unseen is removed by the anchored row-0 (copy 'fetch'
+  instead of a collapsed gen). 600 steps -> unseen blend/hard **1.000**, robust
+  across eval seeds 9/11/13/17/21. think was 0.950; stem-addr now matches/exceeds
+  it WITHOUT the latent buffer — the anchor is a strictly cheaper fix for the
+  row-0 addressing problem (compute scaling buys less than fixing the address).
   Residual fails are model-level (lib0 subtoken truncation comes from the
   same-lookups, no-think row-0 gate collapse), not decoder plumbing.

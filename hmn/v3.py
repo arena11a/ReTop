@@ -59,11 +59,14 @@ class IdentityRegister(nn.Module):
     because no knowledge about the token is needed — only its position.
     """
 
-    def __init__(self, dim, beta_init=30.0, asi_id=None, keys_proj=False, eos_id=1):
+    def __init__(self, dim, beta_init=30.0, asi_id=None, keys_proj=False, eos_id=1,
+                 user_id=None, stem_addr=False):
         super().__init__()
         self.beta = nn.Parameter(torch.tensor(float(beta_init)))
         self.asi_id = asi_id
         self.eos_id = eos_id
+        self.user_id = user_id
+        self.stem_addr = stem_addr
         self.key_proj = nn.Linear(dim, dim)
         self.keys_proj = nn.Linear(dim, dim) if keys_proj else None
 
@@ -106,6 +109,45 @@ class IdentityRegister(nn.Module):
         if self.asi_id is not None and (ids == self.asi_id).any():
             bound2 = torch.where(have, idx, torch.full_like(idx, T)).squeeze(-1).unsqueeze(1)
             behind = torch.arange(T, device=keys.device).unsqueeze(0) <= bound2
+            if self.stem_addr and self.user_id is not None and (ids == self.user_id).any():
+                # v4 M2-dev: stem-addressing. The row-0 (ASI boundary row) query
+                # of the identity register would self-match the ASI column, which
+                # is a masked (unaddressable) boundary — so v3.3 forces gen there
+                # and gen is lexically bound to seen template verbs (M3/M2
+                # measured: 30/30 probes pick a seen-verb token). Stem-addr
+                # anchors that row's attention onto the USER-token column whose
+                # payload (ids[j+1]) is the FIRST token of the template prefix —
+                # i.e. the answer's first segment becomes addressable by design,
+                # not by what the gen head memorized.
+                #
+                # v4 M2-dev N-gram: the anchor extends BEYOND row 0, keyed by
+                # stem position. Answer row t (a = ASI row) is anchored onto
+                # user-region column u+1+(t-a) — a deterministic positional
+                # echo of the template prefix. This is what resolves repeated
+                # subtokens (e.g. "check" -> c,he,c,k): raw identity on the
+                # seed 'c' ties col2 (c->he) vs col4 (c->k), but the positional
+                # anchor picks col3=he unambiguously. Rows beyond the user
+                # region (t-a >= user len) are left to identity fallback, which
+                # at the EOS row correctly closes the gate.
+                #
+                # Deterministic: works the same at train and decode; default
+                # OFF (v3.3 unchanged).
+                u = (ids == self.user_id).float().argmax(-1)                # (B,) USER col
+                r = torch.where(have, idx, torch.full_like(idx, T)).squeeze(-1)  # (B,) ASI row
+                a = a.clone()
+                for b in range(B):
+                    ub, ab = u[b].item(), r[b].item()
+                    for t in range(ab, T):
+                        # gold[i] == user token at col u+i (user text == gold in
+                        # the echo task); copy payload of column j is ids[j+1],
+                        # so gold[i] is copied by anchoring row a+i to col u+i.
+                        c = ub + (t - ab)
+                        if c + 1 >= ab:                # col u+i's payload would
+                            break                      # reach ASI -> EOS row; leave
+                        a[b, t, :] = 0.0               # identity fallback (closes gate)
+                        a[b, t, c] = 1.0
+                        behind[b, t] = False           # copyable row now
+                        mass_same[b, t] = 1.0          # gate opens there
         return a, nxt, n_legal, ctx, behind, mass_same, mask
 
     def forward(self, keys, ids, query, return_attn=False):
@@ -318,7 +360,8 @@ class HMN3(nn.Module):
     def __init__(self, vocab_size, dim=96, state_dim=8, n_layers=3, n_experts=16,
                  top_k=2, use_moe=False, use_think=False, k_max=4, tie_weights=True,
                  gate_bias=0.0, aux_copy=True, asi_id=None, keys_proj=False,
-                 sparse_marginal=False, gate_mode="deterministic"):
+                 sparse_marginal=False, gate_mode="deterministic", user_id=None,
+                 stem_addr=False):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
@@ -329,7 +372,8 @@ class HMN3(nn.Module):
         self.moe_list = nn.ModuleList([
             SparseConditionalCompute(dim, n_experts, top_k) if use_moe else None
             for _ in range(n_layers)])
-        self.ir = IdentityRegister(dim, asi_id=asi_id, keys_proj=keys_proj)
+        self.ir = IdentityRegister(dim, asi_id=asi_id, keys_proj=keys_proj,
+                                   user_id=user_id, stem_addr=stem_addr)
         self.ir.set_vocab(vocab_size)
         # v4 M2: pluggable gate — deterministic stays default (v3.3-final),
         # RelativeGate is the learned alternative supervised by the copy mask.

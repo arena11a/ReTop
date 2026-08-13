@@ -67,12 +67,15 @@ def make_chat_ids(tok, user, gold=None):
     return ids
 
 
-def make_chat_targets(ids, asid, eos):
+def make_chat_targets(ids, asid, eos, stem_row0=False):
     """Per-sequence answer-region labels -> (y, yc, gt).
 
     y  : shifted targets (all answer tokens incl. EOS) for blend CE
     yc : copy-channel targets; EOS and the FIRST answer token (seed=ASI, absent
-         from the prompt) are -100 — the register cannot copy them by design
+         from the prompt) are -100 — the register cannot copy them by design.
+         v4 M2-dev stem_row0: with stem-addressing the ASI boundary row's
+         attention is anchored onto the USER column, so its payload (the
+         template's first token) IS copyable — enable the copy target there.
     gt : 1.0 if the target exists as a copyable prompt payload, 0.0 otherwise
          (EOS / first token / absent). Drives the gen-CE mask and the loss.
     """
@@ -83,7 +86,11 @@ def make_chat_targets(ids, asid, eos):
     y, yc, gt = [-100] * T, [-100] * T, [-1.0] * T
     for t in range(a, T):
         y[t] = targets[t]
-        if targets[t] == eos or t == a:
+        if targets[t] == eos:
+            yc[t] = -100
+            gt[t] = 0.0
+            continue
+        if t == a and not stem_row0:
             yc[t] = -100
             gt[t] = 0.0
             continue
@@ -102,7 +109,7 @@ def make_chat_targets(ids, asid, eos):
 
 
 def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
-                    templates=None):
+                    templates=None, stem_row0=False):
     """Slot-copy batch -> (X, Y, Yc, G).
 
     X: full teacher-forced <s><|user|>{template}<|assistant|>{template}</s>
@@ -126,7 +133,7 @@ def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
         tpl = rng.choice(tpls)
         user = gold = tpl.format(slot=p)
         ids = make_chat_ids(tok, user, gold)
-        y, yc, gt = make_chat_targets(ids, asid, eos)
+        y, yc, gt = make_chat_targets(ids, asid, eos, stem_row0=stem_row0)
         X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
     T = max(len(x) for x in X)
     Xb = torch.full((bs, T), eos, dtype=torch.long)
@@ -141,7 +148,7 @@ def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
     return Xb, Yb, YcB, Gb
 
 
-def make_slot_chain_batch(tok, bs, seed):
+def make_slot_chain_batch(tok, bs, seed, stem_row0=False):
     """v4 M4 multi-step batch -> (X, Y, Yc, G).
 
     user = "fetch {a} and deploy {b}"   (a ∈ pkg-family, b ∈ lib-family)
@@ -161,7 +168,7 @@ def make_slot_chain_batch(tok, bs, seed):
         user = f"fetch {a} and deploy {b}"
         gold = user
         ids = make_chat_ids(tok, user, gold)
-        y, yc, gt = make_chat_targets(ids, asid, eos)
+        y, yc, gt = make_chat_targets(ids, asid, eos, stem_row0=stem_row0)
         X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
     T = max(len(x) for x in X)
     Xb = torch.full((bs, T), eos, dtype=torch.long)
