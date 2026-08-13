@@ -20,7 +20,8 @@ chunked, never loaded fully into memory.
 
 Standard LLMs are single-pass probabilistic generators: one forward → softmax →
 sample. This repo's own experiments verified three hard ceilings of that design
-(`docs/task1_findings.md`, `docs/task2_findings.md`, `docs/distill_design.md`):
+(`legacy/docs/task1_findings.md`, `legacy/docs/task2_findings.md`,
+`legacy/docs/distill_design.md`):
 
 | Ceiling (verified in this repo) | Evidence |
 |---|---|
@@ -66,16 +67,16 @@ Generalization — measured, honest boundaries (§5 of `docs/hmn_v3_design.md`):
 
 | Task | Result | Source |
 |---|---|---|
-| Recall, single-token, 8 pairs/50 keys | 97–99% | `docs/task2_findings.md` |
-| Recall, 2-token values, multi-head | 94–97% | `docs/task2_findings.md` |
-| Distill template curriculum (unseen slots) | syntax 70–91%, API 89–95% | `docs/distill_design.md` |
+| Recall, single-token, 8 pairs/50 keys | 97–99% | `legacy/docs/task2_findings.md` |
+| Recall, 2-token values, multi-head | 94–97% | `legacy/docs/task2_findings.md` |
+| Distill template curriculum (unseen slots) | syntax 70–91%, API 89–95% | `legacy/docs/distill_design.md` |
 
 ---
 
 ## Project layout
 
 ```
-hmn/                        importable package
+hmn/                        core package
   __init__.py               HMN, HMN_Option1, HMN3, HMN3_NoReg
   v2.py                     SelectiveSSM, coupling, MoE, episodic memory
   v3.py                     IdentityRegister, DualHeadDecoder, HMN3
@@ -84,12 +85,16 @@ hmn/                        importable package
 retop.py                    one-command tok / train / chat (writes config sidecar)
 train_v3.py                 v3 slot-copy trainer (uses hmn/recipe)
 gen_slots.py                slot-copy dataset generator (deterministic seen/unseen)
+gen_chat.py                 streaming EN/Math chat corpus generator (data/)
 infer.py                    load checkpoint + tokenizer, generate
+retop_gui.py                4-tab Gradio UI (DATA/TRAIN/CHAT/VERIFY)
 test_hmn.py                 model tests incl. recipe guardrails
 hmn_v33.pt[.json]           verified checkpoint + recipe sidecar
-experiments/                research + verified evals
 experiments/verified/slot_v33_seed42.py   one-command 40/40 guardrail
-docs/                       design, data-prep, findings
+docs/                       design + data-prep (hmn_v3_design.md, data_prep.md)
+data/                       training corpora (git-ignored, from gen_*.py)
+legacy/                     v1/v2 research: findings docs, old generators,
+                            the switch experiments (kept for history)
 retop_tokenizer.json        the tokenizer (vocab 3190)
 ```
 

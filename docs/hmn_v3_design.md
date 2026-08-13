@@ -10,7 +10,7 @@
 ## 1. The problem that motivated v3
 
 The v2 family (reversible coupling + MoE + episodic memory) recalled key→value
-tokens at 97–99% (`docs/task2_findings.md`), but hit a hard wall on
+tokens at 97–99% (`legacy/docs/task2_findings.md`), but hit a hard wall on
 **slot-copy**:
 
 ```

@@ -1,7 +1,7 @@
 """Helix Memory Network (HMN) — public API.
 
 v2  : reversible coupling backbone (SelectiveSSM) + product-key MoE +
-      DifferentiableEpisodicMemory. Verified 2026-08-07 (see docs/task2_findings.md):
+      DifferentiableEpisodicMemory. Verified 2026-08-07 (see legacy/docs/task2_findings.md):
       recall 97-99% (single-token), 94-97% (multi-token), on random-query eval.
 v3  : dual-head decoder with Identity Register (hard copy lane) + optional latent
       thinking buffer. PoC stage — the register solves slot-copy that a softmax

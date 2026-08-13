@@ -25,4 +25,4 @@ retop-gui = "retop_gui:main"
 
 [tool.setuptools]
 packages = ["hmn"]
-py-modules = ["infer", "retop", "train_v3", "gen_slots", "retop_gui"]
+py-modules = ["infer", "retop", "train_v3", "gen_slots", "gen_chat", "retop_gui"]

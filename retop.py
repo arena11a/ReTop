@@ -18,7 +18,7 @@ Three commands:
   python retop.py chat --checkpoint myai.pt --interactive
   python retop.py chat --checkpoint myai.pt --prompt "pip install numpy"
 
-Verified recipe baked in (2026-08-12, docs/task2_findings.md/@distill_design.md):
+Verified recipe baked in (2026-08-12, legacy/docs/task2_findings.md/@distill_design.md):
   - constant LR always (cosine collapses the small-model LR prematurely)
   - loss masked to the ASSISTANT response region for chat data (prompt tokens
     starve the answer head — measured 14.7 nat answer loss under full loss)
