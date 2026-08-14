@@ -276,9 +276,16 @@ retop_tokenizer.json        the tokenizer (vocab 3190)
 - v3.3's known generalization gaps — seen-verb-only templates, repeated-digit
   slot loops, 4/5-digit leaks — are all closed in v4 under two decode-side
   flags (stem-addressing + pos_eos; see the v4 table above). The remaining
-  open item is architectural, not a flag: the copy lane's one-token identity
-  seed cannot disambiguate *position* without the anchor, and pos_eos assumes
-  an echo task (user == gold). Both are honest boundaries, default OFF.
+  open item is architectural, not a flag: reorder/transform tasks (answer =
+  swapped echo, e.g. `deploy lib055 and fetch pkg028`). Four independent
+  probes (long-horizon training, a `swap:` marker, a gate-level decomposition,
+  and a miniature pointer-net) all converge on the same diagnosis: the copy
+  lane re-emits reordered contiguous text fine once started, but the gate
+  collapses to gen at the fragment seam, and gen has no content mechanism —
+  so the model memorizes training digits instead. Closing it needs SEAM
+  RE-SEEDING (carry a fragment-start column through the seam so the pointer
+  re-points content-addressably), an architectural change, not a flag.
+  Honest boundary; default OFF.
 
 ### Reproducibility
 
