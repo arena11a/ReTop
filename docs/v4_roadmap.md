@@ -254,3 +254,24 @@ added from external review feedback.
   Verified: 5-seed chain + repeated-digit chain + slot_v4 all 1.000.
   Residual fails are model-level (lib0 subtoken truncation comes from the
   same-lookups, no-think row-0 gate collapse), not decoder plumbing.
+- **M6 honest boundary (2026-08-13)**: anchor + pos_eos assume an ECHO task
+  (user == gold). Quantified the wall: a no-echo transform (user = "fetch pkg028
+  and deploy lib055", gold = reordered "deploy lib055 and fetch pkg028") fails
+  hard — gate 0.003, empty output — because (a) the identity lane is a
+  one-token-next-copy (no reorder), (b) anchor forces the positional echo, and
+  (c) pos_eos length still matches but the content never appears. This is a
+  DESIGN boundary, not a bug: the register copies what the prompt says, not a
+  computed transform. A reorder/transform task needs the gen head to assemble
+  copied pieces (pointer + gen compose), which the current gate never learns
+  because every v4 task is echo. Stated in README as the honest limit; remains
+  open (M12 candidate).
+- **M12 probe (2026-08-14, experiments/v4/m12_reorder_probe.py)**: trained the
+  swap task 240 steps x2 (bs16) to test whether gen+pointer can COMPOSE a
+  reorder when every gold token exists verbatim in the prompt. stem-addr OFF:
+  loss 4.29->4.19, unseen 0.000 (deterministic, never learns). stem-addr ON:
+  loss 16.3 flat, unseen 0.000 — the anchor actively forces the USER's first
+  token ("fetch") as answer row 0, wrong for the swap. CONCLUSION: the wall is
+  not row-0 seeding — it is that sparse identity attention cannot FLIP two
+  attention sinks (swap two copied fragments). Row-0 gen is necessary but not
+  sufficient; M12 requires a compositional mechanism the register lane lacks.
+  Reorder/transform remains OPEN.
