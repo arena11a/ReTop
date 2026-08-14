@@ -286,6 +286,19 @@ added from external review feedback.
   a copy in blend). M12 needs a SEEDED POINTER mechanism: let the gen head
   initiate a copy into the register, i.e. a pointer register rather than a
   next-token identity only.
+- **M12b read-only gate decomposition (2026-08-14,
+  experiments/v4/m12b_substring_chain.py)**: with the CORRECT continuation fed
+  forward on the trained chain ckpt, the copy lane re-emits ~70% of reordered
+  rows EXACTLY (11/16, 11/18) at gate 0.997 — so the "flip two attention
+  sinks" framing in M12 was TOO PESSIMISTIC: reordered contiguous text IS
+  copyable once a row starts. The wall decomposes into two micro-mechanisms:
+  (a) row 0 content-initiation (gate 0.000 refuses to open for the reordered
+  head; gen has no content seed) and (b) fragment seams — per-prev-token
+  gate closes (0.003) or points wrong exactly at ' and' (the seam between
+  swapped fragments), then re-opens past it. So M12's concrete mechanism is
+  not "composition" but an explicit RESTART: the anchor needs a
+  positional/structural way to start a copy at fragment n (seeded pointer),
+  and the gate needs the counterpart. Well-scoped; remains OPEN.
 - **M6 chain length generalization (2026-08-14)**: existing 2-slot stem-addr
   ckpt, zero retraining, on UNSEEN 3-slot chains (fetch {a} and deploy {b} and
   stop {c}, both seen + unseen ids): pos_eos=True -> 1.000 (30/30), pos_eos=False
