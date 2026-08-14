@@ -92,6 +92,7 @@ guardrail-verified, default-OFF so `v3.3` repro is bit-identical
 | M6 repeated-digit slots (`pkg333..`) | + `pos_eos` (decode) | **1.00** hard+blend (was 0.333) |
 | M6 chain long-EOS loop | + `pos_eos` | hard 0.948 → **1.00** |
 | M8 baseline (same size/task) | HMN3 664K vs vanilla 667K vs NoReg 342K | HMN3 1.00/1.00; vanilla + NoReg **0.00** on unseen (vanilla rote-fits seen: `pkg099→pkg049`) |
+| v3.3 matrix closed (M2-dev+M6) | same stem-addr ckpt + pos_eos | 4-digit 0.925→**1.00**, 5-digit 0.925→**1.00**, alnum→**1.00**, repeated 0.333→**1.00** |
 
 Design principle that fell out of M6: **the copy pointer fixes CONTENT; a
 length-bound fixes TERMINATION.** The latent 'think' buffer meanwhile added ~0
