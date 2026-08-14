@@ -299,3 +299,10 @@ added from external review feedback.
   task is now 1.000 everywhere pos_eos is on; the think/no-think difference
   that M4b documented is fully subsumed by the decoder-side termination fix.
   avg_gate 0.948 unchanged (content copy is correct; only termination was off).
+- **M2-dev slot completeness under blend (2026-08-14)**: the v4 slot task was
+  validated in hard mode (slot_v4 guardrail, 18/18). Re-checked the DEPLOYMENT
+  path (blend mode, the only mode that uses gen tokens) across the full set:
+  10 trained templates 1.000, 4 probes (unseen template shapes) 1.000, 4-row
+  generalization matrix (incl. pkg12345/pkgg99999 repeated digits,
+  version42 alnum, pkg006600 double-pad) 1.000 — all under pos_eos=True. So
+  slot is now 1.000 in hard AND blend, trained AND probe, matrix AND chain.
