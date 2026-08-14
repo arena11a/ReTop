@@ -292,3 +292,10 @@ added from external review feedback.
   same post-answer recursion). So capacity is length-generalizing up to at
   least 4 slots and robust to unseen verbs/families — the recursion failure
   without pos_eos is purely a termination signal, never a content error.
+- **M6 chain fully closed (2026-08-14)**: pos_eos=True lifts the last chain
+  gap — the 0.950/0.948 hard/blend on the standard 2-slot benchmark — to 1.000
+  for BOTH the think and nothink checkpoints (seed 9, unseen a/b pools, both
+  modes). Combined with the length/generalization findings above, the chain
+  task is now 1.000 everywhere pos_eos is on; the think/no-think difference
+  that M4b documented is fully subsumed by the decoder-side termination fix.
+  avg_gate 0.948 unchanged (content copy is correct; only termination was off).
