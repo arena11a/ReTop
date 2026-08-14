@@ -308,6 +308,26 @@ added from external review feedback.
   on the SAME architecture cannot unlock it. Closes the "signal conditioning"
   branch of M12 — addressing a reorder head requires a MECHANISM change
   (a gate-openable seeded pointer), not louder input features.
+- **M12d miniature pointer-net (2026-08-14,
+  experiments/v4/m12d_pointer_register.py)**: the decisive interlocked test.
+  Built the smallest possible realization of the proposed mechanism — an
+  autoregressive pointer network over prompt columns with the EXACT
+  copy-marginal output layer (M1-verified), learned gate, and blend loss.
+  400 steps: training loss 0.0001 (perfect fit), seen pairs decode OK, but
+  unseen_acc 0.000 with clean digit leakage ('lib003'->'lib063' on unseen,
+  borrowed from training slots). Teacher-forced gate trace: gates-1.0 on copy
+  rows, but the gate COLLAPSES to 0.0 at the fragment seam (' and fetch') and
+  the gen head re-emits memorized digits; copy resumes only after the seam.
+  CONCLUSION: an isolated content-addressable pointer DOES NOT fix reorder —
+  any model given the same objective satisfies the training distribution by
+  memorizing slot digits + gen-substitution at the seam (exactly what HMN
+  does). The true mechanism is SEAM RE-SEEDING: keeping the gate open across
+  the seam and carrying an explicit 'fragment n start column' signal so the
+  pointer re-points content-addressably. Both HMN and this independent
+  miniature fail it. M12 is now hard-closed as a searchable direction: it
+  requires the anchor/gate to carry structure ACROSS fragments, not a bigger
+  pointer. Documented; implementation remains future work (architectural, not
+  a hyperparameter).
 - **M6 chain length generalization (2026-08-14)**: existing 2-slot stem-addr
   ckpt, zero retraining, on UNSEEN 3-slot chains (fetch {a} and deploy {b} and
   stop {c}, both seen + unseen ids): pos_eos=True -> 1.000 (30/30), pos_eos=False
