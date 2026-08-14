@@ -285,3 +285,10 @@ added from external review feedback.
   arbitrary template length (T-dependent), so slot-chain capacity is length
   GENERALIZING, not just template-generalizing. The anchor's c = u + (t-a) is
   T-invariant by construction.
+- **M6 length generalization, stress (2026-08-14, follow-up)**: same ckpt on
+  3- and 4-slot chains with an UNSEEN verb ("open") and unseen id families
+  (bin{...}). pos_eos=True -> 1.000 for BOTH lengths, in hard AND blend modes
+  (3-slot blend pe=False 0.700, 4-slot blend pe=False 0.850, all failures the
+  same post-answer recursion). So capacity is length-generalizing up to at
+  least 4 slots and robust to unseen verbs/families — the recursion failure
+  without pos_eos is purely a termination signal, never a content error.
