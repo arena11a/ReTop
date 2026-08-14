@@ -34,3 +34,6 @@ jobs:
 
       - name: v4 slot guardrail (stem-addr + pos_eos matrix)
         run: python experiments/verified/slot_v4.py 60
+
+      - name: v4 chain guardrail (pos_eos, 5 seeds + 3-slot length-gen)
+        run: python experiments/verified/chain_v4.py 60

@@ -6,16 +6,18 @@ order, and asserts:
   1. test_hmn                — model-level forward/backward/reversibility
   2. M1 sparse parity        — sparse copy-marginal bit-identical to dense
   3. v3.3 seed-42 40/40      — shipped hmn_v33.pt still exact on unseen
-  4. M8 baseline smoke       — HMN3 (stem-addr) beats vanilla + NoReg on the
-                              same-size slot task at short horizon
-  5. M6 pos_eos              — repeated-digit slots 1.000 under pos_eos on a
-                              freshly trained stem-addr checkpoint
+4. M8 baseline smoke       — HMN3 (stem-addr) beats vanilla + NoReg on the
+                               same-size slot task at short horizon
+    5. slot_v4                 — 10 trained + 4 probes + matrix 1.000 (+ pos_eos)
+    6. chain_v4                — 2-slot 5 seeds hard+blend + 3-slot length-gen
+                                all 1.000 under pos_eos; 3-slot control < 1.0
+                                confirms the termination fix is what closes it
 
 Every step exits non-zero on failure, so `python
 experiments/verified/v4_guardrail.py` fails loudly like CI.
 
 Run: python experiments/verified/v4_guardrail.py
-     # ~2-3 min CPU (shortened training horizons vs the milestone runs)
+     # ~3-4 min CPU (shortened training horizons vs the milestone runs)
 """
 import os
 import subprocess
@@ -37,6 +39,7 @@ def main():
     run(["experiments/v4/m1_sparse_parity.py"])
     run(["experiments/verified/slot_v33_seed42.py"])
     run(["experiments/verified/slot_v4.py", "60"])   # short-horizon, still asserts 1.0
+    run(["experiments/verified/chain_v4.py", "60"])  # short-horizon, 5 seeds + 3-slot
     run(["experiments/v4/m8_baseline.py", "--smoke", "--steps", "60", "--bs", "8"])
     print("\nV4 GUARDRAIL PASSED")
 
