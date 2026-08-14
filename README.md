@@ -5,8 +5,10 @@
 two lanes separate — one that *thinks* and one that *copies verbatim*.
 
 Its headline result: re-emitting the **exact literal of an UNSEEN token** from
-the prompt, at **40/40** on the canonical slot-copy eval — something a
-single-pass softmax decoder structurally cannot do — trained in ~7 minutes on a
+the prompt, at **40/40** on the canonical slot-copy eval — a capability a
+same-size single-pass softmax decoder does NOT reproduce on unseen inputs
+(measured 0/40 in `experiments/v4/m8_baseline.py`; it rote-fits the pairs it
+saw) — trained in ~7 minutes on a
 4-core CPU with ~4 GB RAM.
 
 ```
@@ -262,14 +264,14 @@ retop_tokenizer.json        the tokenizer (vocab 3190)
 - `HMN3` builds a `(B, T, vocab)` attention-mass tensor per forward — fine for
   the toy sequence lengths, don't scale to long contexts without reworking the
   copy-marginal.
-- Copy-gate generalizes over slot *values* but not over *templates* (§2 of the
-  design doc) — the Identity Register is not yet a general copy operation.
-- Repeated-identical tokens inside a slot let the copy lane loop (gate stays
-  high); the boundary rule cannot fire. See `docs/hmn_v3_design.md` §5.
+- v3.3's known generalization gaps — seen-verb-only templates, repeated-digit
+  slot loops, 4/5-digit leaks — are all closed in v4 under two decode-side
+  flags (stem-addressing + pos_eos; see the v4 table above). The remaining
+  open item is architectural, not a flag: the copy lane's one-token identity
+  seed cannot disambiguate *position* without the anchor, and pos_eos assumes
+  an echo task (user == gold). Both are honest boundaries, default OFF.
 
----
-
-## Reproducibility
+### Reproducibility
 
 Every generator and trainer takes a `--seed`; slot data, splits, and decodes are
 deterministic (greedy). The seed-42 eval guardrail
