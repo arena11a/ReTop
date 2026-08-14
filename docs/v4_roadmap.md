@@ -227,6 +227,20 @@ added from external review feedback.
   pkg049). HMN3_NoReg (342K, register removed) = 0.0 everywhere. HMN3 +
   stem-addr = 1.0 on trained AND never-seen probes. The copy lane is not an
   optimization nicety: it is the only component that can re-emit an unseen
-  prompt token. README can now state this with evidence.
+  prompt token.
+- **M6 finding (2026-08-13)**: after stem-addr, think adds ~0 on the tasks it
+  was built for (chain: stem-only hard 0.948 == stem+think 0.948; blend both
+  1.000). The latent buffer was compensating for row-0 addressing, which the
+  deterministic anchor now does cheaper. M6 is NOT 'think v2' — the correct
+  turn is to solve the residual the anchor does NOT cover. Two closed:
+  (a) repeated-subtoken slot (pkg333): content was already correct (anchor)
+  but decode never knew WHEN the answer ends — gate stays ~0.93 (seed '3'
+  still has a twin) so boundary_eos cannot fire. (b) chain long-EOS loop, same
+  shape. Fix = pos_eos: in the echo task len(answer) == len(user tokens) ==
+  len(prompt)-3 is known a priori, so the decoder forces EOS exactly there.
+  Result: repeated-digit 0.333 -> **1.000** (hard+blend), chain hard 0.948 ->
+  **1.000** on all seeds. Deterministic decoder-time rule, default OFF, same
+  family as boundary_eos/cycle_break. design principle: the pointer fixes
+  CONTENT, the length-bound fixes TERMINATION. README can now state this with evidence.
   Residual fails are model-level (lib0 subtoken truncation comes from the
   same-lookups, no-think row-0 gate collapse), not decoder plumbing.

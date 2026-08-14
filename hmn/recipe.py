@@ -184,7 +184,8 @@ def make_slot_chain_batch(tok, bs, seed, stem_row0=False):
 
 
 def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
-                     max_new=40, boundary_eos=False, cycle_break=False):
+                     max_new=40, boundary_eos=False, cycle_break=False,
+                     pos_eos=False):
     """Exact-match on the two-slot chain task for UNSEEN slot pairs.
     a drawn from `a_slots`, b from `b_slots` (each record re-sampled).
     Returns (accuracy, avg_gate, avg_gen_tokens)."""
@@ -198,7 +199,8 @@ def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
         gold = f"fetch {a} and deploy {b}"
         prompt = make_chat_ids(tok, gold)
         out, g, ng = decode_v33(model, tok, prompt, mode=mode, max_new=max_new,
-                                boundary_eos=boundary_eos, cycle_break=cycle_break)
+                                boundary_eos=boundary_eos, cycle_break=cycle_break,
+                                pos_eos=pos_eos)
         tot += 1
         ok += int(out.strip() == gold)
         gates.append(g); ngen += ng
@@ -282,7 +284,7 @@ def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
 
 
 def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
-               boundary_eos=False, device=None, cycle_break=False):
+               boundary_eos=False, device=None, cycle_break=False, pos_eos=False):
     """Greedy decode. mode:
       blend  -> argmax of (1-g)*gen + g*copy
       hard   -> if g > gate_thr: argmax(copy_dist) else argmax(blend)
@@ -303,12 +305,26 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
       (the chain task legitimately re-emits tokens like '0' across segments);
       the (prev,next) window is unique per true answer. Deterministic
       (decoder-time stop rule, not a model change).
+    pos_eos (v4 M6): answer-length-bounded stop. In the echo task the answer is
+      a positional copy of the user content, so its token count is KNOWN at
+      decode: len(answer) = len(user tokens) = len(prompt)-3 (<s>,<|user|>,
+      <|assistant|>). When the emitted count reaches that length force EOS.
+      This closes the repeated-subtoken loop (pkg333 -> '333333'): the anchor
+      guarantees the CONTENT, and the length bound guarantees WHEN it ends —
+      the gate stays ~0.93 (seed '3' still has a twin) so boundary_eos cannot
+      fire, but the answer is structurally finished. Same decoder-time
+      determinism family as boundary_eos/cycle_break. Safe only for echo tasks
+      where user == gold (slot + chain); default OFF.
     Returns (text, gate_avg, n_gen).
     """
     ids = list(prompt_ids)
     eos = tok.token_to_id(EOS)
     gates, n_gen = [], 0
     seen_pairs = set()
+    # v4 M6: expected answer length = user content tokens, known a priori for
+    # echo tasks (user == gold). Weaker than it looks: if a future non-echo
+    # task needs it, the model must learn to emit EOS itself (pos_eos OFF).
+    ans_len = max(0, len(prompt_ids) - 3) if pos_eos else None
     with torch.no_grad():
         for _ in range(max_new):
             inp = torch.tensor([ids], device=device)
@@ -322,7 +338,9 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
                 prev = ids[-1]
                 cand = copy.argmax(-1).item()
                 pair = (prev, cand)
-            if cycle_break and pair is not None and pair in seen_pairs:
+            if pos_eos and len(ids) - len(prompt_ids) >= ans_len:
+                nxt = eos                          # answer structurally complete
+            elif cycle_break and pair is not None and pair in seen_pairs:
                 nxt = eos                          # segment replay -> stop
             elif boundary_eos and len(ids) > len(prompt_ids) and g < gate_thr:
                 nxt = eos
@@ -342,7 +360,7 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
 
 
 def eval_slots(model, tok, slots, template=DEFAULT_TEMPLATE, mode="blend", seed=0,
-               boundary_eos=False, max_new=16):
+               boundary_eos=False, max_new=16, pos_eos=False):
     """Exact-match accuracy on a slot list (unseen validation by convention).
 
     Returns (accuracy, avg_gate, avg_gen_tokens). eval_slots is the seed-42
@@ -356,7 +374,7 @@ def eval_slots(model, tok, slots, template=DEFAULT_TEMPLATE, mode="blend", seed=
         gold = template.format(slot=p)
         prompt = make_chat_ids(tok, gold)
         out, g, ng = decode_v33(model, tok, prompt, mode=mode, max_new=max_new,
-                                boundary_eos=boundary_eos)
+                                boundary_eos=boundary_eos, pos_eos=pos_eos)
         tot += 1
         ok += int(out.strip() == gold)
         gates.append(g); ngen += ng
