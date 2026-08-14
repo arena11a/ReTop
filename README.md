@@ -128,6 +128,26 @@ pip install -e .            # installs the retop / retop-infer / retop-gui comma
 > the repo root, but the `retop*` console commands (incl. the GUI) only exist
 > after it. It pulls the `hmn` package into your environment — no GPU needed.
 
+### Compute devices (auto-detect — no flags needed)
+
+Every entry point (`train_v3.py`, the guardrails, `infer.py`, `retop.py chat`,
+the GUI) resolves the device once via `hmn.recipe.resolve_device` and threads it
+through batches, evals and decode. Resolution order:
+
+1. an explicit `--device` flag (e.g. `--device cuda:0`),
+2. the `RETOP_DEVICE` env var (e.g. `RETOP_DEVICE=mps`),
+3. auto-detect: `cuda` → `mps` → `cpu` (first one available).
+
+A CPU-only machine is untouched (falls back to `cpu`); a machine with a CUDA or
+Apple-silicon GPU actually uses it — no configuration required. Everything is
+verified CPU-safe: the full `experiments/verified/v4_guardrail.py --device cpu`
+passes, and `test_hmn.py` runs on CPU by design.
+
+```bash
+python train_v3.py --steps 600 --device cuda        # use a real GPU
+RETOP_DEVICE=cpu python train_v3.py --steps 600     # force CPU anywhere
+```
+
 ### 1. Verify the shipped checkpoint (guardrail, ~25 s CPU)
 
 ```bash
@@ -235,7 +255,8 @@ hmn/                        core package
   v2.py                     SelectiveSSM, coupling, MoE, episodic memory
   v3.py                     IdentityRegister, DualHeadDecoder, HMN3
   recipe.py                 v3.3 recipe: make_chat_ids, loss_v33, decode_v33,
-                            make_slot_batch, eval_slots  ← single source of truth
+                            make_slot_batch, eval_slots, resolve_device
+                            ← single source of truth
 retop.py                    one-command tok / train / chat (writes config sidecar)
 train_v3.py                 v3 slot-copy trainer (uses hmn/recipe)
 gen_slots.py                slot-copy dataset generator (deterministic seen/unseen)
@@ -245,6 +266,7 @@ retop_gui.py                4-tab Gradio UI (DATA/TRAIN/CHAT/VERIFY)
 test_hmn.py                 model tests incl. recipe guardrails
 hmn_v33.pt[.json]           verified checkpoint + recipe sidecar
 experiments/verified/slot_v33_seed42.py   one-command 40/40 guardrail
+experiments/verified/v4_guardrail.py      full v4 gate: tests + M1 + M8 + slots + chains
 docs/                       design + data-prep (hmn_v3_design.md, data_prep.md)
 data/                       training corpora (git-ignored, from gen_*.py)
 retop_tokenizer.json        the tokenizer (vocab 3190)

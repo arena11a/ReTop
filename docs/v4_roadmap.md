@@ -102,7 +102,7 @@ Not chased early. Comes after smart.
 | M3b | _new_ Template pooling | train on many verbs, probe held-out verbs | `train_v3.py` | 10 trained verbs -> all 1.000; held-out verb (mount/uninstall/clean/check) still 0.000 at gate 0.001 |
 | M4 | Think D1 | wire + validate on multi-step | `hmn/v3.py`, `recipe.py`, `train_v3.py` | **DONE**: new 2-slot chain task (disjoint pkg/lib families); think 0.925 vs no-think 0.900 (300+500 steps, stable); think also halves fails 13->6/60 and removes the empty-output gate-collapse class -> thinking wins on multi-step. Residual: EOS-loop at g~0.96 both modes (decode-level, not think) |
 | M4b | _new_ | EOS reliability on chain task | `recipe.py` (decode) | **DONE**: cycle guard (2-token window, decoder-time only). no-think 0.900->0.925, think 0.925->0.950; guardrails bit-identical. Residual model-level fails (not decode): `lib0` subtoken truncate + no-think row-0 gate collapse -> M2-dev. BOTH closed by M2-dev stem-addr (row-0) + M6 pos_eos (termination): chain hard 0.948 -> 1.000 on 5 seeds |
-| M5 | GPU spec | silver/gold + MoE@large | `retop.py` | val good, no crash |
+| M5 | GPU spec | silver/gold + MoE@large | `retop.py` | **PARTIAL (2026-08-14)**: device support landed — `resolve_device()` in `recipe.py` (explicit `--device` > `RETOP_DEVICE` env > cuda→mps→cpu auto), threaded through `train_v3.py`, guardrails, `infer.py`, `retop.py chat`, GUI, and the m1/m8/m12b experiments; `v4_guardrail.py --device` forwards to every sub-step. CPU-only machines verified untouched (full guardrail `--device cpu` green). Open: silver/gold specs + MoE@large actually tuned/validated on real CUDA hardware |
 | M6 | Think D2 | latent-slot (if M4 wins) | `hmn/v3.py`, `recipe.py` | beats D1 |
 | M7 | GUI v4 | toggles + v4 verify matrix | `retop_gui.py` | think/spec toggle usable |
 | M8 | **Baseline** | HMN vs vanilla transformer & HMN3_NoReg, same size, same task | `experiments/v4/m8_baseline.py` | **DONE (2026-08-13)**: HMN3 664K = 1.000/1.000 (trained/probe); vanilla 667K = 0.000 (fits SEEN slots 1.0 by rote, memorizes unseen ids pkg099->pkg049); HMN3_NoReg 342K = 0.000. Copy pointer is required — softmax cannot re-emit unseen prompt tokens |
@@ -359,3 +359,19 @@ added from external review feedback.
   generalization matrix (incl. pkg12345/pkgg99999 repeated digits,
   version42 alnum, pkg006600 double-pad) 1.000 — all under pos_eos=True. So
   slot is now 1.000 in hard AND blend, trained AND probe, matrix AND chain.
+- **M5 device support (2026-08-14)**: previously every entry point hardcoded
+  CPU (`map_location="cpu"`, no `.to()`), so a real GPU was never touched even
+  when present. Added `resolve_device()` to `hmn/recipe.py` (resolution:
+  explicit `--device` flag > `RETOP_DEVICE` env > auto cuda→mps→cpu) and
+  threaded it through `make_slot_batch`, `make_slot_chain_batch`, `eval_slots`,
+  `eval_slot_chains`, `decode_v33` (running-input device), and `seed_guardrail`
+  (CUDA seeding too). Callers updated: `train_v3.py` (`--device`, model/batch/
+  eval `.to(dev)`), `slot_v33_seed42.py`, `slot_v4.py`, `chain_v4.py`,
+  `m1_sparse_parity.py`, `m8_baseline.py`, `m12b_substring_chain.py`,
+  `retop.py chat`, `infer.py`, `retop_gui.py` (chat tab no longer hardcoded
+  CPU), and `v4_guardrail.py` forwards `--device` to every sub-step.
+  Verification on the CPU-only sandbox: `test_hmn.py` PASSED, M1 parity OK,
+  slot_v33 40/40, full `v4_guardrail.py --device cpu` PASSED (slot_v4 60 +
+  chain_v4 60 + m8 smoke), `RETOP_DEVICE=cpu` path OK, `train_v3 --device cpu`
+  OK — CPU fallback untouched. Remaining M5 work: silver/gold specs + MoE@large
+  validated on actual CUDA hardware.
