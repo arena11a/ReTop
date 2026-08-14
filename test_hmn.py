@@ -235,6 +235,58 @@ def test_recipe_decode_boundary_rule():
           f"boundary rule stops early ({ob!r} -> {len(ob)} chars vs no-boundary {len(onb)} chars)")
 
 
+def test_recipe_cycle_break_self_pair():
+    print("[recipe decode_v33 cycle_break ignores (x,x) self-pairs]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    vocab = tok.get_vocab_size()
+    digit = tok.token_to_id("9")  # repeated-identical output token (pkg99999 run)
+
+    prompt = make_chat_ids(tok, "pip install pkg09990")
+
+    # repeat-dummy: always next = '9' (legit repeated identical emission).
+    # max_new=6 -> '999999' emitted regardless of cycle_break what token.
+    class RepeatDummy(nn.Module):
+        def forward(self, x):
+            T = x.shape[1]
+            logits = torch.zeros(1, T, vocab)
+            logits[0, -1, digit] = 10.0
+            return {"logits": logits,
+                    "gen_logits": logits.log_softmax(-1),
+                    "copy_dist": logits.softmax(-1),
+                    "g": torch.ones(1, T).fill_(0.997)}
+
+    out_cb, _, _ = decode_v33(RepeatDummy(), tok, prompt, max_new=6,
+                              cycle_break=True, mode="copy", pos_eos=False)
+    check(out_cb == "999999",
+          f"repeated identical tokens survive cycle_break ({out_cb!r})")
+
+    # true replay (non-self transitions within a recopied segment) still stops.
+    # A deterministic 9,8,9,8... cycle produces pairs (9,8) and (8,9); the
+    # second (9,8) is a segment replay and must fire EOS.
+    alt = tok.token_to_id("8")
+    ctr = {"n": 0}
+
+    class ReplayDummy(nn.Module):
+        def forward(self, x):
+            T_ = x.shape[1]
+            logits = torch.zeros(1, T_, vocab)
+            pick = digit if ctr["n"] % 2 == 0 else alt
+            ctr["n"] += 1
+            logits[0, -1, pick] = 10.0
+            return {"logits": logits,
+                    "gen_logits": logits.log_softmax(-1),
+                    "copy_dist": logits.softmax(-1),
+                    "g": torch.ones(1, T_).fill_(0.997)}
+
+    ctr["n"] = 0
+    out_rb, _, _ = decode_v33(ReplayDummy(), tok, prompt, max_new=12,
+                              cycle_break=True, mode="copy", pos_eos=False)
+    # emits 9,8,9,8 then the (8,9) replay pair fires on the 5th candidate ->
+    # text is exactly "9898" (stops BEFORE an unbounded replay)
+    check(out_rb == "9898",
+          f"true replay triggers cycle EOS, got {out_rb!r} (expected '9898')")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_v2_forward_backward()
@@ -247,4 +299,5 @@ if __name__ == "__main__":
     test_recipe_copy_ce_is_manual_logp()
     test_recipe_chat_ids_no_special_split()
     test_recipe_decode_boundary_rule()
+    test_recipe_cycle_break_self_pair()
     print("\nALL TESTS PASSED")

@@ -242,5 +242,15 @@ added from external review feedback.
   **1.000** on all seeds. Deterministic decoder-time rule, default OFF, same
   family as boundary_eos/cycle_break. design principle: the pointer fixes
   CONTENT, the length-bound fixes TERMINATION. README can now state this with evidence.
+- **M6 chain on UNSEEN FORMATS (2026-08-13)**: anchor+pos_eos is format-agnostic
+  — chain with 4-digit pkgs, alnum libs, and repeated-digit slots (pkg99999)
+  all decode 1.000 (hard+blend) without retraining. Along the way found and
+  fixed a REAL decode bug: `cycle_break` false-positives on repeated identical
+  output tokens (prev==cand, e.g. the '9' run in pkg99999) — the (prev,next)
+  window that is "unique per true answer" breaks when the answer itself reuses
+  a token consecutively. Fix: ignore self-pairs (prev==cand) in the cycle
+  detector; the true EOS-loop replays a multi-token segment ('and deploy
+  lib039…') whose transitions are non-self, so M4b detection is preserved.
+  Verified: 5-seed chain + repeated-digit chain + slot_v4 all 1.000.
   Residual fails are model-level (lib0 subtoken truncation comes from the
   same-lookups, no-think row-0 gate collapse), not decoder plumbing.

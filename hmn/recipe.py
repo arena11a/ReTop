@@ -337,7 +337,10 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
             if len(ids) > len(prompt_ids) + 1:
                 prev = ids[-1]
                 cand = copy.argmax(-1).item()
-                pair = (prev, cand)
+                if prev != cand:                      # ignore (x,x) self-pairs:
+                    pair = (prev, cand)               # repeated identical tokens
+                                                      # (99999) are legitimately
+                                                      # consecutive, not a replay
             if pos_eos and len(ids) - len(prompt_ids) >= ans_len:
                 nxt = eos                          # answer structurally complete
             elif cycle_break and pair is not None and pair in seen_pairs:
