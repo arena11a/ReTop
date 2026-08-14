@@ -36,10 +36,8 @@ def main():
     run(["test_hmn.py"])
     run(["experiments/v4/m1_sparse_parity.py"])
     run(["experiments/verified/slot_v33_seed42.py"])
+    run(["experiments/verified/slot_v4.py", "60"])   # short-horizon, still asserts 1.0
     run(["experiments/v4/m8_baseline.py", "--smoke", "--steps", "60", "--bs", "8"])
-    # M6 pos_eos is validated in docs/v4_roadmap.md §6 (repeated-digit 0.333 ->
-    # 1.000) on the M2-dev checkpoint; the m8 smoke re-trains the stem-addr
-    # path here so the full gate is exercised on every run.
     print("\nV4 GUARDRAIL PASSED")
 
 

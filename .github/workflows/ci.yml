@@ -31,3 +31,6 @@ jobs:
 
       - name: v3.3 seed-42 guardrail (40/40 exact)
         run: python experiments/verified/slot_v33_seed42.py
+
+      - name: v4 slot guardrail (stem-addr + pos_eos matrix)
+        run: python experiments/verified/slot_v4.py 60
