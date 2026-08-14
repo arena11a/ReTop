@@ -77,6 +77,27 @@ Generalization — measured, honest boundaries (§5 of `docs/hmn_v3_design.md`):
 | Templates `import / run / apt install` | 0/40 | gate is lexicon-bound to the trained template — NOT a general "copy prompt tail" op |
 | Repeated-digit slots (`pkg333..pkg999`) | 3/9 | copy lane loops (gate stays ≥0.93), boundary rule can't fire |
 
+### v4 — M2-dev/M6 (2026-08-13, `docs/v4_roadmap.md`) — the two rows above closed
+
+The two honest-boundary rows were *not* fundamental: **stem-addressing** makes
+row-0 addressable (flag `<--stem-addr>` on `train_v3.py`), and **pos_eos**
+(bound answer length at decode) closes termination. Everything above is
+guardrail-verified, default-OFF so `v3.3` repro is bit-identical
+(`test_hmn.py`, M1 parity, seed-42 40/40 all pass).
+
+| Milestone | Config | Result |
+|---|---|---|
+| M2-dev slot, 10 templates + 4 never-seen probes | `--stem-addr`, 600 steps, unseen slots | trained 1.00, probes `mount/uninstall/clean/check` **1.00** (were 0.00 in every prior config) |
+| M2-dev→M4 chain, no-think | `--stem-addr`, 600 steps | unseen blend/hard **1.00**, robust across 5 seeds |
+| M6 repeated-digit slots (`pkg333..`) | + `pos_eos` (decode) | **1.00** hard+blend (was 0.333) |
+| M6 chain long-EOS loop | + `pos_eos` | hard 0.948 → **1.00** |
+| M8 baseline (same size/task) | HMN3 664K vs vanilla 667K vs NoReg 342K | HMN3 1.00/1.00; vanilla + NoReg **0.00** on unseen (vanilla rote-fits seen: `pkg099→pkg049`) |
+
+Design principle that fell out of M6: **the copy pointer fixes CONTENT; a
+length-bound fixes TERMINATION.** The latent 'think' buffer meanwhile added ~0
+once the anchor existed (chain hard 0.948 with or without it) — compute
+scaling bought less than fixing the address.
+
 ---
 
 ## Quickstart — running in ~8 minutes

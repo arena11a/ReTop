@@ -22,13 +22,14 @@ model the same courtesy of EOS-token stopping (learned), which is the vanilla
 equivalent. No template/probe slot overlap between train and eval.
 
 Run:  python experiments/v4/m8_baseline.py            # ~300 steps default
-"""
-OBSERVED (600 steps, 10 templates, unseen-slot eval, seed-stable):
+
+Observed (600 steps, 10 templates, unseen-slot eval, seed-stable):
   HMN3      (664K, stem-addr): trained 1.000 / probes 1.000
   HMN3_NoReg(342K)           : 0.000 / 0.000   (no copy lane at all)
   Vanilla   (667K)           : 0.000 / 0.000, BUT 1.0 on SEEN slots and memorizes
              unseen ids (pkg099->pkg049 in single-tpl probe): the softmax head
              fits seen pairs by rote and fails on unseen — not a decoder bug.
+"""
 import argparse
 import os
 import time
@@ -163,6 +164,9 @@ def train_steps(model, opt, tok, steps, bs, templates, desc):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--steps", type=int, default=600)
+    ap.add_argument("--smoke", action="store_true",
+                    help="fast CI-mode: 60 steps per model, prints HMN3-vs-others "
+                         "gap only (no per-template table)")
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--templates",
                     default=("pip install {slot}|import {slot}|run {slot}|"
@@ -176,6 +180,9 @@ def main():
     tok = build_tok()
     tpls = [t.strip() for t in args.templates.split("|") if t.strip()]
     vocab = tok.get_vocab_size()
+
+    if args.smoke:
+        args.steps = min(args.steps, 60)
 
     print(f"vocab={vocab} templates={len(tpls)} steps={args.steps}")
 
@@ -199,6 +206,15 @@ def main():
     train_steps(noreg, opt2, tok, args.steps, args.bs, tpls, "HMN3_NoReg")
     train_steps(vanilla, opt3, tok, args.steps, args.bs, tpls, "Vanilla")
 
+    if args.smoke:
+        hmn_avg = sum(eval_model(hmn, tok, PKGS_UNSEEN, t, "blend", seed=11)
+                      for t in tpls[:2]) / min(2, len(tpls))
+        v_avg = sum(eval_model(vanilla, tok, PKGS_UNSEEN, t, "blend", seed=11)
+                    for t in tpls[:2]) / min(2, len(tpls))
+        assert hmn_avg >= 1.0, "HMN3 must generalize on unseen slots (regression)"
+        assert v_avg <= hmn_avg, "vanilla must not out-copy the register harness"
+        print(f"  smoke OK: HMN3 {hmn_avg:.3f} >= vanilla {v_avg:.3f}")
+        return 0
     print("\n== eval: unseen slots, trained templates + never-trained probes ==")
     for name, model in [("HMN3(stem)", hmn), ("HMN3_NoReg", noreg),
                         ("Vanilla", vanilla)]:
@@ -212,6 +228,10 @@ def main():
             print(f"    trained[{t.split()[0]:<10}]={v:.3f}")
         for t, v in zip(PROBE_TEMPLATES, probes):
             print(f"    probe  [{t.split()[0]:<10}]={v:.3f}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
