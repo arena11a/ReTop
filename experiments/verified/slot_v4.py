@@ -26,7 +26,8 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
-from hmn.recipe import eval_slots, make_slot_batch, seed_guardrail
+from hmn.recipe import (eval_slots, make_slot_batch, resolve_device,
+                        seed_guardrail)
 
 TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
 SEEN = [f"pkg{i:03d}" for i in range(60)]
@@ -43,19 +44,20 @@ MATRIX = {
 }
 
 
-def build_model(tok, steps):
+def build_model(tok, steps, device=None):
     torch.manual_seed(42)
     seed_guardrail(42)
+    dev = resolve_device(device)
     tpls = [t.strip() for t in TPL_STR.split("|")]
     m = HMN3(tok.get_vocab_size(), dim=96, state_dim=8, n_layers=3,
              use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"),
              keys_proj=False, aux_copy=True, sparse_marginal=True,
              gate_mode="deterministic", use_think=False, k_max=4,
-             user_id=tok.token_to_id("<|user|>"), stem_addr=True)
+             user_id=tok.token_to_id("<|user|>"), stem_addr=True).to(dev)
     opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
     for step in range(1, steps + 1):
         X, Y, Yc, G = make_slot_batch(tok, SEEN, 16, step, templates=tpls,
-                                      stem_row0=True)
+                                      stem_row0=True, device=dev)
         opt.zero_grad()
         logits = m(X)["logits"]
         loss = torch.nn.CrossEntropyLoss(ignore_index=-100)(
@@ -63,30 +65,36 @@ def build_model(tok, steps):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 5.0)
         opt.step()
-    return m
+    return m, dev
 
 
 def main():
-    steps = int(sys.argv[1]) if len(sys.argv) > 1 else 600
+    args = [a for a in sys.argv[1:] if not a.startswith("--device")]
+    steps = int(args[0]) if args else 600
+    device = None
+    for i, a in enumerate(sys.argv[1:]):
+        if a == "--device" and i + 1 < len(sys.argv[1:]):
+            device = sys.argv[i + 2]
     tok = Tokenizer.from_file(TOKENIZER)
-    m = build_model(tok, steps)
+    m, dev = build_model(tok, steps, device=device)
     p = sum(pp.numel() for pp in m.parameters())
-    print(f"trained {steps} steps | {p:,} params")
+    print(f"trained {steps} steps | {p:,} params | device {dev}")
     m.eval()
     tpls = [t.strip() for t in TPL_STR.split("|")]
 
     results = {}
     for t in tpls:
         a, _, _ = eval_slots(m, tok, UNSEEN, template=t, mode="hard", seed=11,
-                             boundary_eos=True, pos_eos=True)
+                             boundary_eos=True, pos_eos=True, device=dev)
         results[t] = a
     for t in PROBES:
         a, _, _ = eval_slots(m, tok, UNSEEN, template=t, mode="hard", seed=13,
-                             boundary_eos=True, pos_eos=True)
+                             boundary_eos=True, pos_eos=True, device=dev)
         results[t] = a
     for name, slots in MATRIX.items():
         a, _, _ = eval_slots(m, tok, slots, template="pip install {slot}",
-                             mode="hard", seed=9, boundary_eos=True, pos_eos=True)
+                             mode="hard", seed=9, boundary_eos=True, pos_eos=True,
+                             device=dev)
         results[name] = a
 
     ok = True

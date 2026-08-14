@@ -42,7 +42,7 @@ from tokenizers import Tokenizer
 
 from hmn import HMN3, HMN3_NoReg
 from hmn.recipe import (EOS, eval_slots, make_chat_ids, make_slot_batch,
-                        seed_guardrail)
+                        resolve_device, seed_guardrail)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PKGS_SEEN = [f"pkg{i:03d}" for i in range(60)]
@@ -105,14 +105,15 @@ class _VanillaBlock(nn.Module):
         return x
 
 
-def decode_vanilla(model, tok, prompt_ids, max_new=16):
+def decode_vanilla(model, tok, prompt_ids, max_new=16, device=None):
     """Greedy argmax decode for the vanilla transformer. Stops on EOS token.
     No copy/gate signals exist, so this is the honest baseline decoder."""
     eos = tok.token_to_id(EOS)
     ids = list(prompt_ids)
+    dev = resolve_device(device)
     with torch.no_grad():
         for _ in range(max_new):
-            inp = torch.tensor([ids])
+            inp = torch.tensor([ids], device=dev)
             logits = model(inp)[0, -1]
             nxt = logits.argmax(-1).item()
             if nxt == eos:
@@ -121,29 +122,30 @@ def decode_vanilla(model, tok, prompt_ids, max_new=16):
     return tok.decode(ids[len(prompt_ids):])
 
 
-def eval_model(model, tok, slots, tpl, mode, seed=0, max_new=16):
+def eval_model(model, tok, slots, tpl, mode, seed=0, max_new=16, device=None):
     """Dispatch exact-match eval on the right decoder for each architecture."""
     if isinstance(model, HMN3):
         a, g, _ = eval_slots(model, tok, slots, template=tpl, mode=mode, seed=seed,
-                             boundary_eos=True, max_new=max_new)
+                             boundary_eos=True, max_new=max_new, device=device)
         return a
     model.eval()
     ok = tot = 0
     for p in slots:
         gold = tpl.format(slot=p)
         prompt = make_chat_ids(tok, gold)
-        out = decode_vanilla(model, tok, prompt, max_new=max_new)
+        out = decode_vanilla(model, tok, prompt, max_new=max_new, device=device)
         ok += int(out.strip() == gold)
         tot += 1
     model.train()
     return ok / tot
 
 
-def train_steps(model, opt, tok, steps, bs, templates, desc):
+def train_steps(model, opt, tok, steps, bs, templates, desc, device=None):
     losses = []
     t0 = time.time()
     for step in range(1, steps + 1):
-        X, Y, Yc, G = make_slot_batch(tok, PKGS_SEEN, bs, step, templates=templates)
+        X, Y, Yc, G = make_slot_batch(tok, PKGS_SEEN, bs, step, templates=templates,
+                                      device=device)
         opt.zero_grad()
         out = model(X)
         if isinstance(model, (HMN3,)):
@@ -173,8 +175,11 @@ def main():
                              "apt install {slot}|remove {slot}|delete {slot}|"
                              "get {slot}|cache {slot}|fetch {slot}|pip uninstall {slot}"))
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--device", default=None,
+                    help="compute device (auto-detect default; see resolve_device)")
     args = ap.parse_args()
 
+    dev = resolve_device(args.device)
     seed_guardrail(args.seed)
     torch.manual_seed(args.seed)
     tok = build_tok()
@@ -184,15 +189,15 @@ def main():
     if args.smoke:
         args.steps = min(args.steps, 60)
 
-    print(f"vocab={vocab} templates={len(tpls)} steps={args.steps}")
+    print(f"vocab={vocab} templates={len(tpls)} steps={args.steps} device={dev}")
 
     hmn = HMN3(vocab, dim=96, state_dim=8, n_layers=3,
                use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"),
                keys_proj=False, aux_copy=True, sparse_marginal=True,
                gate_mode="deterministic", use_think=False, k_max=4,
-               user_id=tok.token_to_id("<|user|>"), stem_addr=True)
-    noreg = HMN3_NoReg(vocab, dim=96, state_dim=8, n_layers=3)
-    vanilla = VanillaTransformer(vocab, dim=96, n_layers=3, mlp_scale=4)
+               user_id=tok.token_to_id("<|user|>"), stem_addr=True).to(dev)
+    noreg = HMN3_NoReg(vocab, dim=96, state_dim=8, n_layers=3).to(dev)
+    vanilla = VanillaTransformer(vocab, dim=96, n_layers=3, mlp_scale=4).to(dev)
 
     for name, m in [("HMN3(stem-addr)", hmn), ("HMN3_NoReg", noreg),
                     ("Vanilla", vanilla)]:
@@ -202,14 +207,16 @@ def main():
     opt2 = torch.optim.AdamW(noreg.parameters(), lr=1e-3)
     opt3 = torch.optim.AdamW(vanilla.parameters(), lr=1e-3)
 
-    train_steps(hmn, opt1, tok, args.steps, args.bs, tpls, "HMN3(stem-addr)")
-    train_steps(noreg, opt2, tok, args.steps, args.bs, tpls, "HMN3_NoReg")
-    train_steps(vanilla, opt3, tok, args.steps, args.bs, tpls, "Vanilla")
+    train_steps(hmn, opt1, tok, args.steps, args.bs, tpls, "HMN3(stem-addr)", dev)
+    train_steps(noreg, opt2, tok, args.steps, args.bs, tpls, "HMN3_NoReg", dev)
+    train_steps(vanilla, opt3, tok, args.steps, args.bs, tpls, "Vanilla", dev)
 
     if args.smoke:
-        hmn_avg = sum(eval_model(hmn, tok, PKGS_UNSEEN, t, "blend", seed=11)
+        hmn_avg = sum(eval_model(hmn, tok, PKGS_UNSEEN, t, "blend", seed=11,
+                                 device=dev)
                       for t in tpls[:2]) / min(2, len(tpls))
-        v_avg = sum(eval_model(vanilla, tok, PKGS_UNSEEN, t, "blend", seed=11)
+        v_avg = sum(eval_model(vanilla, tok, PKGS_UNSEEN, t, "blend", seed=11,
+                               device=dev)
                     for t in tpls[:2]) / min(2, len(tpls))
         assert hmn_avg >= 1.0, "HMN3 must generalize on unseen slots (regression)"
         assert v_avg <= hmn_avg, "vanilla must not out-copy the register harness"
@@ -218,9 +225,11 @@ def main():
     print("\n== eval: unseen slots, trained templates + never-trained probes ==")
     for name, model in [("HMN3(stem)", hmn), ("HMN3_NoReg", noreg),
                         ("Vanilla", vanilla)]:
-        trained = [eval_model(model, tok, PKGS_UNSEEN, t, "blend", seed=11)
+        trained = [eval_model(model, tok, PKGS_UNSEEN, t, "blend", seed=11,
+                              device=dev)
                    for t in tpls]
-        probes = [eval_model(model, tok, PKGS_UNSEEN, t, "blend", seed=13)
+        probes = [eval_model(model, tok, PKGS_UNSEEN, t, "blend", seed=13,
+                             device=dev)
                   for t in PROBE_TEMPLATES]
         print(f"  {name:<12} trained_avg={sum(trained)/len(trained):.3f} "
               f"probe_avg={sum(probes)/len(probes):.3f}")

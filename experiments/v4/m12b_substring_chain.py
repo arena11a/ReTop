@@ -47,7 +47,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
-from hmn.recipe import make_chat_ids, seed_guardrail
+from hmn.recipe import make_chat_ids, resolve_device, seed_guardrail
 import train_v3 as tv
 
 TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
@@ -55,14 +55,15 @@ TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
 
 def main():
     tok = Tokenizer.from_file(TOKENIZER)
+    dev = resolve_device()
     m = HMN3(tok.get_vocab_size(), dim=96, state_dim=8, n_layers=3,
              use_moe=False, gate_bias=0.0, asi_id=tv.asi_id(tok),
              keys_proj=False, aux_copy=True, sparse_marginal=True,
              gate_mode="deterministic", use_think=False, k_max=4,
              user_id=tok.token_to_id("<|user|>"), stem_addr=False)
     m.load_state_dict(torch.load("/tmp/opencode/m4_c2b_nothink.pt",
-                                 map_location="cpu", weights_only=False))
-    m.eval()
+                                 map_location=dev, weights_only=False))
+    m.to(dev).eval()
     seed_guardrail(42)
 
     cases = [
@@ -82,7 +83,7 @@ def main():
         n_emit = len(gold_toks)
         seq = ids_full + gold_toks
         with torch.no_grad():
-            d = m(torch.tensor([seq]))
+            d = m(torch.tensor([seq], device=dev))
         cp = d["copy_dist"][0]           # (T+ngold, V)
         # copy argmax at each answer row, compared to gold_toks
         hits = []

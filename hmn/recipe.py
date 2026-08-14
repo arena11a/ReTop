@@ -18,6 +18,7 @@ Tokenizers: chat specials are encoded PER-PART and joined (never
 encode("<s>..user..<|assistant|>") in one call — the ReTop BPE splits specials
 when concatenated with text, yielding wrong prompt ids).
 """
+import os
 import random
 
 import torch
@@ -32,6 +33,29 @@ USER = "<|user|>"
 ASSIST = "<|assistant|>"
 
 SPECIAL_TOKENS = [BOS, EOS, UNK, PAD, USER, ASSIST]
+
+
+def resolve_device(device=None):
+    """Pick the compute device for the session.
+
+    Resolution order:
+      1. explicit `device` argument (torch.device or str),
+      2. the RETOP_DEVICE env var (e.g. RETOP_DEVICE=cuda:0),
+      3. auto-detect: cuda -> mps -> cpu (first one available).
+
+    Everything below (batch builders, evals, decode) threads the result so a
+    GPU is actually used when present; a CPU-only machine falls back to cpu.
+    """
+    if device is None:
+        device = os.environ.get("RETOP_DEVICE", "auto")
+    if device in ("auto", "auto-detect"):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(device)
+
 
 # default chat-template used by make_chat_ids / decode (override via args)
 DEFAULT_TEMPLATE = "pip install {slot}"
@@ -109,7 +133,7 @@ def make_chat_targets(ids, asid, eos, stem_row0=False):
 
 
 def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
-                    templates=None, stem_row0=False):
+                    templates=None, stem_row0=False, device=None):
     """Slot-copy batch -> (X, Y, Yc, G).
 
     X: full teacher-forced <s><|user|>{template}<|assistant|>{template}</s>
@@ -135,20 +159,21 @@ def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
         ids = make_chat_ids(tok, user, gold)
         y, yc, gt = make_chat_targets(ids, asid, eos, stem_row0=stem_row0)
         X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
+    dev = resolve_device(device)
     T = max(len(x) for x in X)
-    Xb = torch.full((bs, T), eos, dtype=torch.long)
-    Yb = torch.full((bs, T), -100, dtype=torch.long)
-    YcB = torch.full((bs, T), -100, dtype=torch.long)
-    Gb = torch.full((bs, T), -1.0, dtype=torch.float)
+    Xb = torch.full((bs, T), eos, dtype=torch.long, device=dev)
+    Yb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    YcB = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Gb = torch.full((bs, T), -1.0, dtype=torch.float, device=dev)
     for j in range(bs):
-        Xb[j, :len(X[j])] = torch.tensor(X[j])
-        Yb[j, :len(Y[j])] = torch.tensor(Y[j])
-        YcB[j, :len(YC[j])] = torch.tensor(YC[j])
-        Gb[j, :len(G[j])] = torch.tensor(G[j])
+        Xb[j, :len(X[j])] = torch.tensor(X[j], device=dev)
+        Yb[j, :len(Y[j])] = torch.tensor(Y[j], device=dev)
+        YcB[j, :len(YC[j])] = torch.tensor(YC[j], device=dev)
+        Gb[j, :len(G[j])] = torch.tensor(G[j], device=dev)
     return Xb, Yb, YcB, Gb
 
 
-def make_slot_chain_batch(tok, bs, seed, stem_row0=False):
+def make_slot_chain_batch(tok, bs, seed, stem_row0=False, device=None):
     """v4 M4 multi-step batch -> (X, Y, Yc, G).
 
     user = "fetch {a} and deploy {b}"   (a ∈ pkg-family, b ∈ lib-family)
@@ -170,22 +195,23 @@ def make_slot_chain_batch(tok, bs, seed, stem_row0=False):
         ids = make_chat_ids(tok, user, gold)
         y, yc, gt = make_chat_targets(ids, asid, eos, stem_row0=stem_row0)
         X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
+    dev = resolve_device(device)
     T = max(len(x) for x in X)
-    Xb = torch.full((bs, T), eos, dtype=torch.long)
-    Yb = torch.full((bs, T), -100, dtype=torch.long)
-    YcB = torch.full((bs, T), -100, dtype=torch.long)
-    Gb = torch.full((bs, T), -1.0, dtype=torch.float)
+    Xb = torch.full((bs, T), eos, dtype=torch.long, device=dev)
+    Yb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    YcB = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Gb = torch.full((bs, T), -1.0, dtype=torch.float, device=dev)
     for j in range(bs):
-        Xb[j, :len(X[j])] = torch.tensor(X[j])
-        Yb[j, :len(Y[j])] = torch.tensor(Y[j])
-        YcB[j, :len(YC[j])] = torch.tensor(YC[j])
-        Gb[j, :len(G[j])] = torch.tensor(G[j])
+        Xb[j, :len(X[j])] = torch.tensor(X[j], device=dev)
+        Yb[j, :len(Y[j])] = torch.tensor(Y[j], device=dev)
+        YcB[j, :len(YC[j])] = torch.tensor(YC[j], device=dev)
+        Gb[j, :len(G[j])] = torch.tensor(G[j], device=dev)
     return Xb, Yb, YcB, Gb
 
 
 def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
                      max_new=40, boundary_eos=False, cycle_break=False,
-                     pos_eos=False):
+                     pos_eos=False, device=None):
     """Exact-match on the two-slot chain task for UNSEEN slot pairs.
     a drawn from `a_slots`, b from `b_slots` (each record re-sampled).
     Returns (accuracy, avg_gate, avg_gen_tokens)."""
@@ -200,7 +226,7 @@ def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
         prompt = make_chat_ids(tok, gold)
         out, g, ng = decode_v33(model, tok, prompt, mode=mode, max_new=max_new,
                                 boundary_eos=boundary_eos, cycle_break=cycle_break,
-                                pos_eos=pos_eos)
+                                pos_eos=pos_eos, device=device)
         tot += 1
         ok += int(out.strip() == gold)
         gates.append(g); ngen += ng
@@ -363,7 +389,7 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
 
 
 def eval_slots(model, tok, slots, template=DEFAULT_TEMPLATE, mode="blend", seed=0,
-               boundary_eos=False, max_new=16, pos_eos=False):
+               boundary_eos=False, max_new=16, pos_eos=False, device=None):
     """Exact-match accuracy on a slot list (unseen validation by convention).
 
     Returns (accuracy, avg_gate, avg_gen_tokens). eval_slots is the seed-42
@@ -377,7 +403,8 @@ def eval_slots(model, tok, slots, template=DEFAULT_TEMPLATE, mode="blend", seed=
         gold = template.format(slot=p)
         prompt = make_chat_ids(tok, gold)
         out, g, ng = decode_v33(model, tok, prompt, mode=mode, max_new=max_new,
-                                boundary_eos=boundary_eos, pos_eos=pos_eos)
+                                boundary_eos=boundary_eos, pos_eos=pos_eos,
+                                device=device)
         tot += 1
         ok += int(out.strip() == gold)
         gates.append(g); ngen += ng
@@ -389,4 +416,6 @@ def seed_guardrail(seed=42):
     """Deterministic RNG reset for reproducible training/eval."""
     random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     return seed

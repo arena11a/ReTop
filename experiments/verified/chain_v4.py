@@ -28,7 +28,7 @@ from tokenizers import Tokenizer
 
 from hmn import HMN3
 from hmn.recipe import (decode_v33, eval_slot_chains, make_chat_ids,
-                        make_slot_chain_batch, seed_guardrail)
+                        make_slot_chain_batch, resolve_device, seed_guardrail)
 
 TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
 SEEN_A = [f"pkg{i:03d}" for i in range(0, 30)]
@@ -42,28 +42,30 @@ ID_POOL = ([f"pkg{i:03d}" for i in range(40, 60)] +
 VERBS = ["fetch", "deploy", "stop"]
 
 
-def build_model(tok, steps):
+def build_model(tok, steps, device=None):
     torch.manual_seed(42)
     seed_guardrail(42)
+    dev = resolve_device(device)
     m = HMN3(tok.get_vocab_size(), dim=96, state_dim=8, n_layers=3,
              use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"),
              keys_proj=False, aux_copy=True, sparse_marginal=True,
              gate_mode="deterministic", use_think=False, k_max=4,
-             user_id=tok.token_to_id("<|user|>"), stem_addr=True)
+             user_id=tok.token_to_id("<|user|>"), stem_addr=True).to(dev)
     opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
     lossf = nn.CrossEntropyLoss(ignore_index=-100)
     for step in range(1, steps + 1):
-        X, Y, _, _ = make_slot_chain_batch(tok, 16, step, stem_row0=True)
+        X, Y, _, _ = make_slot_chain_batch(tok, 16, step, stem_row0=True,
+                                           device=dev)
         opt.zero_grad()
         logits = m(X)["logits"]
         loss = lossf(logits.reshape(-1, logits.shape[-1]), Y.reshape(-1))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 5.0)
         opt.step()
-    return m
+    return m, dev
 
 
-def eval_three_slot(model, tok, trials=20, pos_eos=True, mode="hard"):
+def eval_three_slot(model, tok, trials=20, pos_eos=True, mode="hard", device=None):
     import random
     rng = random.Random(7)
     ok = tot = 0
@@ -72,7 +74,7 @@ def eval_three_slot(model, tok, trials=20, pos_eos=True, mode="hard"):
         user = f"{VERBS[0]} {u} and {VERBS[1]} {w} and {VERBS[2]} {v}"
         out, _, _ = decode_v33(model, tok, make_chat_ids(tok, user),
                                mode=mode, max_new=80, boundary_eos=True,
-                               pos_eos=pos_eos)
+                               pos_eos=pos_eos, device=device)
         tot += 1
         ok += int(out.strip() == user)
     return ok / tot
@@ -80,10 +82,14 @@ def eval_three_slot(model, tok, trials=20, pos_eos=True, mode="hard"):
 
 def main():
     steps = int(sys.argv[1]) if len(sys.argv) > 1 else 600
+    device = None
+    for i, a in enumerate(sys.argv[1:]):
+        if a == "--device" and i + 1 < len(sys.argv[1:]):
+            device = sys.argv[i + 2]
     tok = Tokenizer.from_file(TOKENIZER)
-    m = build_model(tok, steps)
+    m, dev = build_model(tok, steps, device=device)
     p = sum(pp.numel() for pp in m.parameters())
-    print(f"trained {steps} steps | {p:,} params")
+    print(f"trained {steps} steps | {p:,} params | device {dev}")
     m.eval()
 
     ok = True
@@ -93,16 +99,17 @@ def main():
         for mode in ("hard", "blend"):
             a, _, _ = eval_slot_chains(m, tok, UNSEEN_A, UNSEEN_B, seed=seed,
                                        mode=mode, max_new=40, boundary_eos=True,
-                                       pos_eos=True)
+                                       pos_eos=True, device=dev)
             ok &= a >= 1.0
             row.append(f"{mode}={a:.3f}")
         print(f"  seed {seed:<3d} " + "  ".join(row))
 
-    a3 = eval_three_slot(m, tok, trials=20, pos_eos=True, mode="hard")
+    a3 = eval_three_slot(m, tok, trials=20, pos_eos=True, mode="hard", device=dev)
     ok &= a3 >= 1.0
     print(f"3-slot chain (unseen length, zero retrain) hard+pos_eos: {a3:.3f}")
 
-    a3_raw = eval_three_slot(m, tok, trials=20, pos_eos=False, mode="hard")
+    a3_raw = eval_three_slot(m, tok, trials=20, pos_eos=False, mode="hard",
+                             device=dev)
     print(f"3-slot chain WITHOUT pos_eos (informational, must be < 1.0): "
           f"{a3_raw:.3f}")
 

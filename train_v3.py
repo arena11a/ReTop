@@ -42,7 +42,7 @@ from hmn import HMN3, HMN3_NoReg
 from hmn.recipe import (CHAIN_SLOTS_A, CHAIN_SLOTS_A_U, CHAIN_SLOTS_B,
                         CHAIN_SLOTS_B_U, DEFAULT_TEMPLATE, eval_slot_chains,
                         eval_slots, loss_v33, make_slot_batch,
-                        make_slot_chain_batch, seed_guardrail)
+                        make_slot_chain_batch, resolve_device, seed_guardrail)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOS = "</s>"
@@ -119,7 +119,14 @@ def main():
                          "(default: single DEFAULT_TEMPLATE)")
     ap.add_argument("--sparse-marginal", action="store_true",
                     help="v4 M1: use the sparse copy-marginal path (no (B,T,V) copy tensor)")
+    ap.add_argument("--device", default=None,
+                    help="compute device: auto (default; cuda->mps->cpu), a device str "
+                         "(cuda:0, mps, cpu), or the RETOP_DEVICE env var. A real GPU "
+                         "is used automatically when present.")
     args = ap.parse_args()
+
+    dev = resolve_device(args.device)
+    print(f"device: {dev}", flush=True)
 
     tpls = [DEFAULT_TEMPLATE] if not args.templates else args.templates.split("|")
     ALL_TEMPLATES = [  # the full pool; probes are chosen from here MINUS trained
@@ -132,7 +139,7 @@ def main():
 
     seed_guardrail(args.seed)
     tok = build_tok()
-    model = build_model(args.arch, args, tok)
+    model = build_model(args.arch, args, tok).to(dev)
     print(f"params: {sum(p.numel() for p in model.parameters()):,} | arch={args.arch} "
           f"sparse={args.sparse_marginal}", flush=True)
 
@@ -144,10 +151,12 @@ def main():
     for step in range(1, args.steps + 1):
         if args.task == "chain":
             X, Y, Yc, G = make_slot_chain_batch(tok, args.bs, step,
-                                                stem_row0=args.stem_addr)
+                                                stem_row0=args.stem_addr,
+                                                device=dev)
         else:
             X, Y, Yc, G = make_slot_batch(tok, PKGS_SEEN, args.bs, step,
-                                          templates=tpls, stem_row0=args.stem_addr)
+                                          templates=tpls, stem_row0=args.stem_addr,
+                                          device=dev)
         opt.zero_grad()
         out = model(X)
         if args.arch == "v31":
@@ -167,15 +176,19 @@ def main():
                 # v4 M4: two-slot chain on UNSEEN slot pairs — the multi-step
                 # eval. seen uses PKGS_SEEN pairings, unseen uses PKGS_UNSEEN.
                 s_b, s_g, _ = eval_slot_chains(model, tok, CHAIN_SLOTS_A, CHAIN_SLOTS_B,
-                                       seed=7, boundary_eos=True, cycle_break=True)
+                                       seed=7, boundary_eos=True, cycle_break=True,
+                                       device=dev)
                 u_b, u_g, u_ng = eval_slot_chains(model, tok, CHAIN_SLOTS_A_U,
                                                   CHAIN_SLOTS_B_U, seed=9,
-                                                  boundary_eos=True, cycle_break=True)
+                                                  boundary_eos=True, cycle_break=True,
+                                                  device=dev)
             else:
                 s_b, s_g, _ = eval_slots(model, tok, PKGS_SEEN, mode="blend",
-                                         seed=7, boundary_eos=True, template=tpls[0])
+                                         seed=7, boundary_eos=True, template=tpls[0],
+                                         device=dev)
                 u_b, u_g, u_ng = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
-                                            seed=9, boundary_eos=True, template=tpls[0])
+                                            seed=9, boundary_eos=True, template=tpls[0],
+                                            device=dev)
             el = time.time() - t0
             line = (f"step {step:5d} loss={loss.item():.3f} "
                     f"seen={s_b:.3f}(g{s_g:.2f}) unseen_blend={u_b:.3f}(g{u_g:.2f},gen{u_ng:.1f})")
@@ -184,12 +197,14 @@ def main():
                     u_h, _, _ = eval_slot_chains(model, tok, CHAIN_SLOTS_A_U,
                                                  CHAIN_SLOTS_B_U,
                                                  seed=9, mode="hard",
-                                                 boundary_eos=True, cycle_break=True)
+                                                 boundary_eos=True, cycle_break=True,
+                                                 device=dev)
                 else:
                     u_h, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="hard",
-                                           seed=9, boundary_eos=True, template=tpls[0])
+                                           seed=9, boundary_eos=True, template=tpls[0],
+                                           device=dev)
                     u_c, _, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="copy", seed=9,
-                                           template=tpls[0])
+                                           template=tpls[0], device=dev)
                     line += f" hard={u_h:.3f} copy={u_c:.3f}"
 
                 # v4 M3: per-template table — all TRAINED templates + NEVER-seen
@@ -200,7 +215,8 @@ def main():
                     for name, tpl in ([(f"trained:{t}", t) for t in tpls]
                                       + [(f"probe:{p}", p) for p in PROBE_TEMPLATES]):
                         a, g, _ = eval_slots(model, tok, PKGS_UNSEEN, mode="blend",
-                                             seed=9, boundary_eos=True, template=tpl)
+                                             seed=9, boundary_eos=True, template=tpl,
+                                             device=dev)
                         print(f"    {name:<16} {a:.3f}  gate={g:.3f}")
                 else:
                     line += f" hard={u_h:.3f}"

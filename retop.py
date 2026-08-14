@@ -38,7 +38,8 @@ import torch.nn as nn
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 from hmn import HMN3, HMN3_NoReg
-from hmn.recipe import decode_v33, loss_v33, make_chat_ids, make_chat_targets, seed_guardrail
+from hmn.recipe import (decode_v33, loss_v33, make_chat_ids, make_chat_targets,
+                        resolve_device, seed_guardrail)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOS = "</s>"
@@ -312,8 +313,9 @@ def chat(args):
         raise SystemExit(f"no config sidecar {side} — retrain with retop.py train")
     tok = Tokenizer.from_file(cfg["tokenizer"])
     model = build_model(cfg.get("arch", "v3"), cfg, tok)
-    model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
-    model.eval()
+    dev = resolve_device(args.device)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=dev))
+    model.to(dev).eval()
     print(f"loaded {cfg.get('arch', 'v3')} ({sum(p.numel() for p in model.parameters()):,} "
           f"params, spec={cfg.get('spec')}) from {args.checkpoint}", flush=True)
     if args.interactive:
@@ -326,12 +328,12 @@ def chat(args):
             if not user:
                 continue
             prompt = make_chat_ids(tok, user)
-            print(decode_v33(model, tok, prompt, args.max_new)[0])
+            print(decode_v33(model, tok, prompt, args.max_new, device=dev)[0])
     else:
         if not args.prompt:
             raise SystemExit("need --prompt or --interactive")
         prompt = make_chat_ids(tok, args.prompt)
-        print(decode_v33(model, tok, prompt, args.max_new)[0])
+        print(decode_v33(model, tok, prompt, args.max_new, device=dev)[0])
 
 
 def main():
@@ -367,6 +369,8 @@ def main():
     p.add_argument("--prompt", default=None, help="one-shot; or --interactive")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default=None,
+                   help="compute device (auto-detect default; see resolve_device)")
     p.set_defaults(fn=chat)
 
     args = ap.parse_args()

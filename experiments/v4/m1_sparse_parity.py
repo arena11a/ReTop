@@ -27,7 +27,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
-from hmn.recipe import make_slot_batch, loss_v33, eval_slots
+from hmn.recipe import make_slot_batch, loss_v33, eval_slots, resolve_device
 
 TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
 CFG = dict(dim=96, layers=3, gate_bias=-1.0)
@@ -35,25 +35,26 @@ SEEN = [f"pkg{i:03d}" for i in range(60)]
 UNSEEN = [f"pkg{i:03d}" for i in range(60, 100)]
 
 
-def build(sparse):
+def build(sparse, device=None):
     tok = Tokenizer.from_file(TOKENIZER)
+    dev = resolve_device(device)
     m = HMN3(tok.get_vocab_size(), dim=CFG["dim"], state_dim=8,
              n_layers=CFG["layers"], use_moe=False, gate_bias=CFG["gate_bias"],
              asi_id=tok.token_to_id("<|assistant|>"), keys_proj=False,
              aux_copy=True, sparse_marginal=sparse)
     m.load_state_dict(torch.load(os.path.join(ROOT, "hmn_v33.pt"),
-                                 map_location="cpu"))
-    m.eval()
-    return m, tok
+                                 map_location=dev))
+    m.to(dev).eval()
+    return m, tok, dev
 
 
 def main():
     torch.manual_seed(0)
-    md, tok = build(False)
-    ms, _ = build(True)
+    md, tok, dev = build(False)
+    ms, _, _ = build(True)
 
     # --- 1. forward logits parity on a slot batch ---
-    X, Y, Yc, G = make_slot_batch(tok, SEEN, 4, seed=3)
+    X, Y, Yc, G = make_slot_batch(tok, SEEN, 4, seed=3, device=dev)
     with torch.no_grad():
         od = md(X)
         os_ = ms(X)
@@ -74,8 +75,10 @@ def main():
         assert d < 1e-4, f"{name} diverged"
 
     # --- 3. exact-match parity on the v3.3 guardrail task ---
-    acc_d, g_d, _ = eval_slots(md, tok, UNSEEN, seed=42, boundary_eos=True)
-    acc_s, g_s, _ = eval_slots(ms, tok, UNSEEN, seed=42, boundary_eos=True)
+    acc_d, g_d, _ = eval_slots(md, tok, UNSEEN, seed=42, boundary_eos=True,
+                               device=dev)
+    acc_s, g_s, _ = eval_slots(ms, tok, UNSEEN, seed=42, boundary_eos=True,
+                               device=dev)
     print(f"guardrail blend dense vs sparse : {acc_d:.3f} vs {acc_s:.3f} "
           f"(gate {g_d:.3f} vs {g_s:.3f})")
     assert abs(acc_d - acc_s) < 1e-9, "guardrail accuracy diverged"

@@ -29,7 +29,7 @@ import torch
 
 from tokenizers import Tokenizer
 
-from hmn.recipe import decode_v33, make_chat_ids
+from hmn.recipe import decode_v33, make_chat_ids, resolve_device
 from retop import SPECS, build_model as retop_build_model
 
 DEFAULT_TOK = os.path.join(ROOT, "retop_tokenizer.json")
@@ -210,7 +210,7 @@ def poll_training():
 
 # --- CHAT tab ----------------------------------------------------------------
 
-CHAT = {"ckpt": None, "model": None, "tok": None}
+CHAT = {"ckpt": None, "model": None, "tok": None, "device": None}
 
 
 def load_chat(ckpt_path, tok_path, dim, layers, gate_bias, max_new, mode):
@@ -236,8 +236,10 @@ def load_chat(ckpt_path, tok_path, dim, layers, gate_bias, max_new, mode):
                         if k in ("dim", "layers", "moe", "gate_bias")})
     try:
         model = retop_build_model(cfg.get("arch", "v3"), cfg, tok)
-        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-        model.eval()
+        dev = resolve_device()
+        model.load_state_dict(torch.load(ckpt_path, map_location=dev))
+        model.to(dev).eval()
+        CHAT["device"] = dev
     except Exception as e:
         return f"failed to load: {e}", ""
     CHAT.update(ckpt=ckpt_path, model=model, tok=tok)
@@ -255,7 +257,8 @@ def chat_generate(prompt, max_new, mode):
     try:
         ids = make_chat_ids(CHAT["tok"], prompt.strip())
         text, gate, ngen = decode_v33(CHAT["model"], CHAT["tok"], ids,
-                                      max_new=int(max_new), mode=mode)
+                                      max_new=int(max_new), mode=mode,
+                                      device=CHAT.get("device"))
     except Exception as e:
         return f"error: {e}", ""
     wraps = (f"\n\n> gate avg **{gate:.2f}** | generate tokens **{int(ngen)}** — "

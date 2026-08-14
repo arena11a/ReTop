@@ -20,7 +20,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN, HMN_Option1, HMN3
-from hmn.recipe import decode_v33, make_chat_ids
+from hmn.recipe import decode_v33, make_chat_ids, resolve_device
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOS = "</s>"
@@ -52,16 +52,17 @@ def build_model(arch, args, tok):
     raise ValueError(f"unknown --arch {arch!r}")
 
 
-def generate(model, tok, prompt_ids, max_new, arch="v2"):
+def generate(model, tok, prompt_ids, max_new, arch="v2", device=None):
     """Greedy decode. v3 uses hmn/recipe.decode_v33 (blend of gen+copy with the
     boundary rule); legacy v2/option1 use softmax argmax."""
+    dev = resolve_device(device)
     if arch == "v3":
-        return decode_v33(model, tok, prompt_ids, max_new)[0]
+        return decode_v33(model, tok, prompt_ids, max_new, device=dev)[0]
     ids = list(prompt_ids)
     eos = tok.token_to_id(EOS)
     with torch.no_grad():
         for _ in range(max_new):
-            inp = torch.tensor([ids])
+            inp = torch.tensor([ids], device=dev)
             out = model(inp)
             logits = out if isinstance(out, torch.Tensor) else out["logits"]
             nxt = logits[0, -1].argmax(-1).item()
@@ -93,19 +94,22 @@ def main():
     ap.add_argument("--interactive", action="store_true", help="REPL loop")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default=None,
+                   help="compute device (auto-detect default; see resolve_device)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
+    dev = resolve_device(args.device)
     tok = build_tokenizer(args.tok)
     model = build_model(args.arch, args, tok)
     try:
-        model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+        model.load_state_dict(torch.load(args.checkpoint, map_location=dev))
     except RuntimeError as e:
         raise SystemExit(
             f"checkpoint does not match --arch {args.arch} config "
             f"(dim={args.dim}, layers={args.layers}, ...). "
             f"Retrain/load with the same hyperparameters used at train time.\n{e}") from e
-    model.eval()
+    model.to(dev).eval()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"loaded {args.arch} ({n_params:,} params) from {args.checkpoint}", flush=True)
 
@@ -118,9 +122,11 @@ def main():
                 break
             if not user:
                 continue
-            print(generate(model, tok, make_chat_ids(tok, user), args.max_new, args.arch))
+            print(generate(model, tok, make_chat_ids(tok, user), args.max_new,
+                          args.arch, device=dev))
     elif args.prompt:
-        print(generate(model, tok, make_chat_ids(tok, args.prompt), args.max_new, args.arch))
+        print(generate(model, tok, make_chat_ids(tok, args.prompt), args.max_new,
+                       args.arch, device=dev))
     else:
         ap.error("need --prompt or --interactive")
 

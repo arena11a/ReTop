@@ -18,7 +18,9 @@ experiments/verified/v4_guardrail.py` fails loudly like CI.
 
 Run: python experiments/verified/v4_guardrail.py
      # ~3-4 min CPU (shortened training horizons vs the milestone runs)
+     # --device cuda  passes the device down to every sub-step (default auto)
 """
+import argparse
 import os
 import subprocess
 import sys
@@ -35,12 +37,18 @@ def run(cmd, cwd=ROOT):
 
 
 def main():
-    run(["test_hmn.py"])
-    run(["experiments/v4/m1_sparse_parity.py"])
-    run(["experiments/verified/slot_v33_seed42.py"])
-    run(["experiments/verified/slot_v4.py", "60"])   # short-horizon, still asserts 1.0
-    run(["experiments/verified/chain_v4.py", "60"])  # short-horizon, 5 seeds + 3-slot
-    run(["experiments/v4/m8_baseline.py", "--smoke", "--steps", "60", "--bs", "8"])
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", default=None,
+                    help="compute device for every sub-step (default auto-detect)")
+    args = ap.parse_args()
+    dev = [] if not args.device else ["--device", args.device]
+    run(["test_hmn.py"])  # pure CPU model-level tests (no device plumbing)
+    run(["experiments/v4/m1_sparse_parity.py"] + dev)
+    run(["experiments/verified/slot_v33_seed42.py"] + dev)
+    run(["experiments/verified/slot_v4.py", "60"] + dev)
+    run(["experiments/verified/chain_v4.py", "60"] + dev)
+    run(["experiments/v4/m8_baseline.py", "--smoke", "--steps", "60", "--bs", "8"] + dev)
     print("\nV4 GUARDRAIL PASSED")
 
 

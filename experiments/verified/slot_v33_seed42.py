@@ -35,7 +35,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
-from hmn.recipe import eval_slots
+from hmn.recipe import eval_slots, resolve_device
 
 CFG = dict(dim=96, layers=3, gate_bias=-1.0)
 CHECKPOINT = os.path.join(ROOT, "hmn_v33.pt")
@@ -45,17 +45,18 @@ UNSEEN = [f"pkg{i:03d}" for i in range(60, 100)]
 TEMPLATE = "pip install {slot}"
 
 
-def load_model(checkpoint):
+def load_model(checkpoint, device=None):
     tok = Tokenizer.from_file(TOKENIZER)
+    dev = resolve_device(device)
     m = HMN3(tok.get_vocab_size(), dim=CFG["dim"], state_dim=8,
              n_layers=CFG["layers"], use_moe=False, gate_bias=CFG["gate_bias"],
              asi_id=tok.token_to_id("<|assistant|>"), keys_proj=False, aux_copy=True)
-    m.load_state_dict(torch.load(checkpoint, map_location="cpu"))
-    m.eval()
-    return m, tok
+    m.load_state_dict(torch.load(checkpoint, map_location=dev))
+    m.to(dev).eval()
+    return m, tok, dev
 
 
-def run_guards(checkpoint):
+def run_guards(checkpoint, device=None):
     """Run all verified guards + generalization probes on a slot-copy checkpoint.
 
     Returns a structured dict consumed by BOTH the CLI (this file) and the GUI
@@ -66,16 +67,16 @@ def run_guards(checkpoint):
     torch.manual_seed(42)
     if not os.path.exists(checkpoint):
         raise FileNotFoundError(checkpoint)
-    m, tok = load_model(checkpoint)
+    m, tok, dev = load_model(checkpoint, device=device)
     n_params = sum(p.numel() for p in m.parameters())
 
     acc, gate, _ = eval_slots(m, tok, UNSEEN, template=TEMPLATE, mode="blend",
-                              seed=42, boundary_eos=True)
+                              seed=42, boundary_eos=True, device=dev)
     acc_h, _, _ = eval_slots(m, tok, UNSEEN, template=TEMPLATE, mode="hard",
-                             seed=42, boundary_eos=True)
+                             seed=42, boundary_eos=True, device=dev)
     struct = TEMPLATE.replace("{slot}", "-r {slot}")
     acc_s, gate_s, _ = eval_slots(m, tok, UNSEEN, template=struct, seed=42,
-                                  boundary_eos=True)
+                                  boundary_eos=True, device=dev)
 
     matrix = []
     for name, slots, tpl in [
@@ -87,7 +88,8 @@ def run_guards(checkpoint):
         ("template 'run'", UNSEEN, "run {slot}"),
         ("template 'apt install'", UNSEEN, "apt install {slot}"),
     ]:
-        a, g, _ = eval_slots(m, tok, slots, template=tpl, seed=42, boundary_eos=True)
+        a, g, _ = eval_slots(m, tok, slots, template=tpl, seed=42, boundary_eos=True,
+                             device=dev)
         matrix.append({"name": name, "ok_n": int(round(a * len(slots))),
                        "total": len(slots), "acc": a, "gate": g})
 
@@ -96,8 +98,8 @@ def run_guards(checkpoint):
             "structural": (acc_s, gate_s, struct), "matrix": matrix, "ok": ok}
 
 
-def main(checkpoint):
-    r = run_guards(checkpoint)
+def main(checkpoint, device=None):
+    r = run_guards(checkpoint, device=device)
     print(f"checkpoint: {checkpoint} ({r['n_params']:,} params, cfg={CFG})")
 
     def guard(name, cond, detail):
@@ -123,4 +125,7 @@ def main(checkpoint):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", default=CHECKPOINT)
-    raise SystemExit(main(ap.parse_args().checkpoint))
+    ap.add_argument("--device", default=None,
+                    help="compute device (auto-detect default; see resolve_device)")
+    args = ap.parse_args()
+    raise SystemExit(main(args.checkpoint, args.device))
