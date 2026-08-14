@@ -95,11 +95,20 @@ guardrail-verified, default-OFF so `v3.3` repro is bit-identical
 | M6 chain long-EOS loop | + `pos_eos` | hard 0.948 → **1.00** |
 | M8 baseline (same size/task) | HMN3 664K vs vanilla 667K vs NoReg 342K | HMN3 1.00/1.00; vanilla + NoReg **0.00** on unseen (vanilla rote-fits seen: `pkg099→pkg049`) |
 | v3.3 matrix closed (M2-dev+M6) | same stem-addr ckpt + pos_eos | 4-digit 0.925→**1.00**, 5-digit 0.925→**1.00**, alnum→**1.00**, repeated 0.333→**1.00** |
+| M6 chain length generalization | same 2-slot ckpt, zero retrain | 3/4-slot chains, unseen verb `open`: **1.00** hard+blend (length-generalizing, not just template) |
+| M6 chain fully closed | `pos_eos` on think + no-think | 0.948/0.950 → **1.00** both variants; avg gate 0.948 unchanged (content was always right, termination was the fix) |
+| M2-dev slot, blend deployment path | `pos_eos` | trained 10/10 + 4 probes + 4-row matrix (repeated/alnum/double-pad) **1.00** hard+blend |
+| M12 reorder probe (honest wall) | trained swap task 240 steps x2 | unseen **0.00** both configs; anchor actively harms (16.3 vs 4.2 loss) — echo-only by design |
 
 Design principle that fell out of M6: **the copy pointer fixes CONTENT; a
 length-bound fixes TERMINATION.** The latent 'think' buffer meanwhile added ~0
-once the anchor existed (chain hard 0.948 with or without it) — compute
-scaling bought less than fixing the address.
+once the anchor existed (chain 0.948 both variants, and `pos_eos` lifts both to
+1.00) — compute scaling bought less than fixing the address. The decoder-side
+fix is length-generalizing: the same 2-slot checkpoint answers 3- and 4-slot
+chains with unseen verbs at 1.00, because the anchor `c = u + (t-a)` is
+T-invariant. Honest wall: this works for *echo* tasks only — a reorder
+transform (`fetch {a} and deploy {b}` → `deploy {b} and fetch {a}`) stays at
+0.00 and the anchor actively harms it (`experiments/v4/m12_reorder_probe.py`).
 
 ---
 
