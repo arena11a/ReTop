@@ -275,6 +275,17 @@ added from external review feedback.
   attention sinks (swap two copied fragments). Row-0 gen is necessary but not
   sufficient; M12 requires a compositional mechanism the register lane lacks.
   Reorder/transform remains OPEN.
+- **M12 probe, long-horizon confirmation (2026-08-14,
+  experiments/v4/m12_reorder_long.py)**: 1200 steps stem-addr OFF. loss
+  4.33->3.97 (echo chain hits ~0.003; the plateau is decisive), unseen_acc
+  0.000 at every 200-step checkpoint. => the reorder wall is STRUCTURAL, not a
+  training-horizon artifact. Root cause narrowed: the gen head cannot SEED a
+  content token at row 0 when the first gold token has no identity anchor —
+  echo tasks never require content-initiation (row 0 is ASI-anchored copy or
+  EOS), so the gen lane has no mechanism for it (can only emit EOS / continue
+  a copy in blend). M12 needs a SEEDED POINTER mechanism: let the gen head
+  initiate a copy into the register, i.e. a pointer register rather than a
+  next-token identity only.
 - **M6 chain length generalization (2026-08-14)**: existing 2-slot stem-addr
   ckpt, zero retraining, on UNSEEN 3-slot chains (fetch {a} and deploy {b} and
   stop {c}, both seen + unseen ids): pos_eos=True -> 1.000 (30/30), pos_eos=False

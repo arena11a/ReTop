@@ -26,11 +26,19 @@ RESULT (2026-08-14, 240 steps x2, bs16, CPU):
   stem-addr ON  : loss 16.3 (flat), unseen_acc 0.000. The anchor forces the
                   USER's first token ("fetch") as answer row 0, which is wrong
                   for the swapped gold -> actively harmful.
+  LONG-HORIZON probe (m12_reorder_long.py, 1200 steps, stem-addr OFF): loss
+  4.33->3.97 (never near the ~0.003 an echo chain reaches), unseen_acc 0.000
+  at every 200-step checkpoint. => the wall is STRUCTURAL, not a training-
+  horizon artifact: the gen head cannot learn to SEED a content token at row 0
+  when the first gold token has no identity anchor. Echo tasks never require
+  it (row 0 is ASI-anchored copy or EOS), so the gen lane has no mechanism for
+  content-initiation — it can only emit EOS (and, in blend, continue-a-copy).
   => CONCLUSION: reorder/transform is beyond the register+pointer lane even
      when every gold token exists verbatim in the prompt. Row-0 gen is not
-     enough; the answer is a COMPOSITION (order changed), and the sparse
-     identity attention has no mechanism to flip two attention sinks. This is
-     the hard edge of M6's "echo-only" assumption and stays OPEN for M12.
+     enough; the model lacks a compositional way to FLIP two attention sinks
+     (swap two copied fragments). Echo-only assumption now empirically bounded
+     at 240 AND 1200 steps; M12 remains open, needing a mechanism for the gen
+     head to initiate a copy (e.g. a seeded pointer register).
 
 Run: python experiments/v4/m12_reorder_probe.py [--steps 240]
 """
