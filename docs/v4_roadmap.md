@@ -275,3 +275,13 @@ added from external review feedback.
   attention sinks (swap two copied fragments). Row-0 gen is necessary but not
   sufficient; M12 requires a compositional mechanism the register lane lacks.
   Reorder/transform remains OPEN.
+- **M6 chain length generalization (2026-08-14)**: existing 2-slot stem-addr
+  ckpt, zero retraining, on UNSEEN 3-slot chains (fetch {a} and deploy {b} and
+  stop {c}, both seen + unseen ids): pos_eos=True -> 1.000 (30/30), pos_eos=False
+  -> 0.833. The failures are the length-boundary recursion (out keeps
+  re-emitting "and deploy {b} and..." past the answer), i.e. exactly the case
+  pos_eos was built for; note the subtoken leak in one failure
+  ("stop lib03021" — '21' continued from lib021). Anchor+pos_eos compose to
+  arbitrary template length (T-dependent), so slot-chain capacity is length
+  GENERALIZING, not just template-generalizing. The anchor's c = u + (t-a) is
+  T-invariant by construction.
