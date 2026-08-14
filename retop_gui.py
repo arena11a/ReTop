@@ -291,6 +291,20 @@ def verify_guards(ckpt_path):
     return status, rows
 
 
+def run_v4_guardrail():
+    """v4 matrix (M7): re-runs the consolidated v4 guardrail script. Blocks the
+    UI for ~2-3 min (subprocess, captured output returned as markdown)."""
+    script = os.path.join(ROOT, "experiments", "verified", "v4_guardrail.py")
+    if not os.path.exists(script):
+        return "v4_guardrail.py not found"
+    import subprocess as _sp
+    cp = _sp.run([sys.executable, script], cwd=ROOT, capture_output=True, text=True)
+    tail = (cp.stdout + cp.stderr).strip().splitlines()
+    brief = "\n".join(line for line in tail
+                      if "PASSED" in line or "OK" in line or "FAILED" in line)
+    return f"**returncode {cp.returncode}**\n```\n{brief}\n```"
+
+
 # --- layout ------------------------------------------------------------------
 
 def build():
@@ -369,6 +383,11 @@ def build():
             ver_md = gr.Markdown("")
             ver_tbl = gr.Dataframe(headers=["check", "acc", "status"],
                                    datatype=["str", "str", "str"], interactive=False)
+            gr.Markdown("**v4 matrix** — one command re-runs every v4 gate "
+                        "(test_hmn, M1 parity, seed-42 40/40, M8 smoke). "
+                        "Takes ~2-3 min CPU.")
+            v4_btn = gr.Button("🚦 Run full v4 guardrail", variant="secondary")
+            v4_md = gr.Markdown("")
         # --- event wiring ---
         gen_btn.click(generate_data, [template, kind, n_seen, n_unseen, seed, out_path],
                       [gen_md, gen_log, data_path_in], queue=True)
@@ -384,6 +403,7 @@ def build():
                        [load_md, load_md], queue=True)
         chat_btn.click(chat_generate, [prompt, max_new, mode_c], [answer, answer], queue=True)
         ver_btn.click(verify_guards, ckpt_v, [ver_md, ver_tbl], queue=True)
+        v4_btn.click(run_v4_guardrail, None, v4_md, queue=True)
     return demo
 
 
