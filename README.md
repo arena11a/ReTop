@@ -136,6 +136,9 @@ gate + teacher-forced evidence), slot-invariant fingerprint retrieval,
 ambiguity escalation, open-world fallback; 10/10 execution on every family
 (`experiments/v5/m4_skills.py`).
 Details + open items: [`docs/v5_omega_roadmap.md`](docs/v5_omega_roadmap.md).
+**v6 (active, branch `v6`)**: scale to a community-trainable foundation
+architecture — IR-as-inverted-index, HF packaging, BF16, distributed training.
+Roadmap: [`docs/v6_scaling_roadmap.md`](docs/v6_scaling_roadmap.md).
 
 ---
 
