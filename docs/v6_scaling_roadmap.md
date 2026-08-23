@@ -35,10 +35,24 @@ semantic change "cross-id ε-mass dropped; twins-uniform snap" must be stated
 in the release notes.
 
 Phased commits (each keeps CI green):
-- **A. intra-dense wins**: replace the second `(B,T,T)` tensor (`same` bool
-  matrix for `mass_same`) and `n_legal` O(T²) reduction with index-derived
-  computations inside the existing dense flow (sort + searchsorted +
-  prefix-sums). No consumer contract changes.
+- **A. intra-dense wins** ✅ 2026-08-23: the second `(B,T,T)` tensor (`same`
+  bool matrix for `mass_same`) and the `n_legal` O(T²) reduction are replaced
+  by index-derived computations inside the existing dense flow (`hmn/v3.py`):
+  `n_legal` is a prefix-sum over a per-column legality vector (the mask's only
+  row dependence is `j <= t`, so a cumsum reproduces it EXACTLY); `mass_same`
+  uses the twins-uniform identity — same-id columns carry bitwise-identical
+  pre-softmax scores (`cos=1` on identical embeddings), so
+  `mass_same[t] = c_t · exp(beta − lse_t)` with `c_t` = legal twins with
+  `j <= t` read off a stable sort + composite-key searchsorted inverted index.
+  No consumer contract changes; dense-vs-sparse parity still 0.000e+00, all
+  guardrails green with identical metrics (40/40 gate 0.775, chain/reorder
+  1.000). Measured stats-section speedup: **7× @ T=512, 72× @ T=2048,
+  153× @ T=4096** (B=4, CPU); removes the `(B,T,T)` bool + its fp32 product
+  (~335 MB transient at T=4096). Unit test `test_v6_m1a_index_stats` pins the
+  brute-force parity (tolerance 1e-4 = FP summation noise only).
+  Also fixed: `experiments/v4/m1_sparse_parity.py` now actually uses
+  `load_compat` (imported-but-unused since M0.5 → strict load crashed on the
+  legacy checkpoint).
 - **B. consumer migration**: introduce `IRStats` container (CSR grouped by
   value-id: legal member positions ascending + cumcounts; per-group payload
   histograms via flattened (b,gid,payload) sort) replacing raw `a` in:

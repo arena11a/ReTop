@@ -265,6 +265,59 @@ def test_seam_anchor_none_parity():
     check(torch.equal(o1["g"], o2["g"]), "gate identical")
 
 
+def test_v6_m1a_index_stats():
+    print("[v6 M1-A: index-derived n_legal/mass_same == brute-force dense]")
+    from hmn.v3 import IdentityRegister
+    ir = IdentityRegister(dim=32, asi_id=5, eos_id=1)
+    torch.manual_seed(3)
+    # keys MUST come from an id->vector table (the model invariant
+    # keys = embed(ids)): same id => identical embedding => exactly equal
+    # sims, which is what the twins-uniform mass_same identity rests on.
+    table = torch.randn(128, 32)
+    for trial, (asi_on, dup) in enumerate([(True, True), (False, True),
+                                           (True, False), (False, False)]):
+        B, T = 3, 14
+        ids = torch.randint(10, 80, (B, T))
+        if dup:
+            ids[:, 4] = ids[:, 9]            # twins straddling a would-be ASI bound
+            ids[:, 0] = ids[:, 2]            # twins at the front edge
+        if asi_on:
+            ids[:, 7] = 5                    # ASI boundary mid-sequence
+            ids[:, 10] = 1                   # EOS payload inside the prompt region
+        keys = table[ids]
+        a, nxt, n_legal, ctx, behind, mass_same, mask = ir._attn(keys, ids)
+        # brute-force v3.3 reference math (pre-M1-A)
+        beta = ir.beta.abs() + 1.0
+        qk = F.normalize(keys, dim=-1)
+        sim = (qk @ qk.transpose(-1, -2)) * beta
+        m = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)
+        if (ids == 5).any():
+            bnd = torch.where((ids == 5).any(-1),
+                              (ids == 5).float().argmax(-1),
+                              torch.full((B,), T)).long()
+            m = m.unsqueeze(0) | (torch.arange(T).unsqueeze(0)
+                                  >= bnd.unsqueeze(-1)).unsqueeze(1)
+        nxt_col = torch.cat([ids[:, 1:], torch.full_like(ids[:, :1], -1)], 1)
+        bad = (nxt_col == 5) | (nxt_col == 1) | (nxt_col == -1)
+        m = m | bad.unsqueeze(1)
+        sim = sim.masked_fill(m, float("-inf"))
+        a_ref = sim.softmax(-1)
+        ref_n_legal = (~m).sum(-1)
+        ref_mass = (a_ref * (ids.unsqueeze(1) == ids.unsqueeze(2)).float()).sum(-1)
+        check(torch.equal(n_legal, ref_n_legal),
+              f"trial{trial}: n_legal exact match")
+        err = (mass_same - ref_mass).abs().max().item()
+        # 1e-4 = FP summation-order noise only; a structural bug (wrong twin
+        # group, boundary off-by-one, bad count) errs at weight magnitude >=1e-2
+        check(err < 1e-4,
+              f"trial{trial}: mass_same matches brute force (max err {err:.2e})")
+    # seam forcing still opens the gate through the overridden stats path
+    anchor = torch.full((1, 14), -100, dtype=torch.long)
+    anchor[0, 11] = 3
+    *_, ms_seam, _ = ir._attn(table[ids[:1]], ids[:1], seam_anchor=anchor)
+    check(ms_seam[0, 11].item() == 1.0, "seam-forced row keeps mass_same=1.0")
+
+
 def test_reorder_anchors_and_batch():
     print("[v5 seam: reorder anchors force the exact gold payload]")
     tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
@@ -364,6 +417,7 @@ if __name__ == "__main__":
     test_recipe_decode_boundary_rule()
     test_recipe_cycle_break_self_pair()
     test_seam_anchor_none_parity()
+    test_v6_m1a_index_stats()
     test_reorder_anchors_and_batch()
     test_decode_seam_mechanics()
     test_skills_recipes_and_coverage()

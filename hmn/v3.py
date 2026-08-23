@@ -86,35 +86,63 @@ class IdentityRegister(nn.Module):
         at seams the SeedPointer-predicted start column re-seeds the chain.
         Forced rows open the gate (mass_same=1.0) and leave `behind`.
         Default None -> bit-identical to v3.3/v4 behavior.
+
+        v6 M1-A (index-derived gate stats): `n_legal` is a prefix-sum over a
+        per-column legality vector and `mass_same` is read off an inverted
+        token->columns index (stable sort + searchsorted + composite keys),
+        removing BOTH the second (B, T, T) bool matrix (`same`) AND the O(T^2)
+        (~mask).sum reduction. The dense attention itself is untouched.
+
+        mass_same identity: cos(q,k)=1 EXACTLY for same-id columns, so every
+        legal twin of row t carries the identical softmax weight exp(beta)/Z_t
+        ("twins-uniform"); therefore
+            mass_same[t] = c_t * exp(beta - lse_t),
+        where c_t = #legal twin columns with j <= t (from the index) and
+        lse_t is the row normalizer of the already-materialized masked sim.
+        Verified against the brute-force (a * same).sum formula in test_hmn.
         """
         B, T, D = keys.shape
         beta = self.beta.abs() + 1.0
         qk = F.normalize(keys, dim=-1)                              # (B,T,D) ids[t]
         ek = qk                                                     # identity addrs
         sim = (qk @ ek.transpose(-1, -2)) * beta                    # (B,T,T)
-        mask = torch.triu(torch.ones(T, T, device=keys.device, dtype=torch.bool), 1)
+        pos = torch.arange(T, device=keys.device)
+        # ASI boundary: first illegal column per sequence (T when absent)
+        bound = torch.full((B,), T, device=keys.device, dtype=torch.long)
         if self.asi_id is not None and (ids == self.asi_id).any():
-            idx = (ids == self.asi_id).float().argmax(-1, keepdim=True)  # (B,1)
-            have = (ids == self.asi_id).any(-1, keepdim=True)            # (B,1)
+            idx = (ids == self.asi_id).float().argmax(-1)                # (B,)
+            have = (ids == self.asi_id).any(-1)                          # (B,)
             bound = torch.where(have, idx, torch.full_like(idx, T)).long()
-            legal = (torch.arange(T, device=keys.device).unsqueeze(0).unsqueeze(1)
-                     < bound.unsqueeze(-1))                              # (B,1,T)
-            mask = mask.unsqueeze(0).expand(B, T, T) | ~legal
+        legal_col = pos.unsqueeze(0) < bound.unsqueeze(-1)               # (B,T)
         # payload per column: ids[j+1]; last column has no successor
         nxt_col = torch.cat([ids[:, 1:], torch.full_like(ids[:, :1], -1)], dim=1)
         bad_payload = (nxt_col == self.asi_id) | (nxt_col == self.eos_id) | (nxt_col == -1)
-        mask = mask | bad_payload.unsqueeze(1).expand(B, T, T)
+        col_ok = legal_col & ~bad_payload                                # (B,T)
+        mask = (torch.triu(torch.ones(T, T, device=keys.device,
+                                       dtype=torch.bool), 1).unsqueeze(0)
+                | (~legal_col).unsqueeze(1) | bad_payload.unsqueeze(1))
         sim = sim.masked_fill(mask, float("-inf"))
+        lse = sim.logsumexp(-1)                                # row normalizer (B,T)
         a = sim.softmax(-1)                                    # position attention
-        n_legal = (~mask).sum(-1)                               # (B,T)
+        n_legal = col_ok.cumsum(-1)                             # (B,T) prefix count
+        # inverted index: token -> sorted member columns (stable => positions
+        # ascend within each token group; invalid members sort past position T)
+        sids, perm = ids.sort(dim=-1, stable=True)
+        grp = torch.cat([torch.ones(B, 1, dtype=torch.bool, device=keys.device),
+                         sids[:, 1:] != sids[:, :-1]], 1).cumsum(-1) - 1
+        col_grp = torch.empty_like(grp).scatter_(1, perm, grp)   # group id / column
+        ok_sorted = col_ok.gather(1, perm)
+        pos_sorted = pos.unsqueeze(0).expand(B, T).gather(1, perm)
+        key = grp * (T + 1) + torch.where(ok_sorted, pos_sorted, T)
+        start = torch.searchsorted(sids, ids, side="left")
+        c_same = torch.searchsorted(key, col_grp * (T + 1) + pos.unsqueeze(0)
+                                    .expand(B, T), side="right") - start
+        mass_same = c_same.float() * torch.exp(beta - lse)      # twins-uniform
         nxt = torch.cat([ids[:, 1:], torch.zeros_like(ids[:, :1])], dim=1)
         ctx = (a.unsqueeze(-1) * keys.unsqueeze(1)).sum(2)     # (B,T,D) raw blend
-        same = (ids.unsqueeze(1) == ids.unsqueeze(2))          # (B,T,T)
-        mass_same = (a * same.float()).sum(-1)                 # (B,T) 0..1
         behind = torch.zeros(B, T, dtype=torch.bool, device=keys.device)
         if self.asi_id is not None and (ids == self.asi_id).any():
-            bound2 = torch.where(have, idx, torch.full_like(idx, T)).squeeze(-1).unsqueeze(1)
-            behind = torch.arange(T, device=keys.device).unsqueeze(0) <= bound2
+            behind = pos.unsqueeze(0) <= bound.unsqueeze(-1)
             if self.stem_addr and self.user_id is not None and (ids == self.user_id).any():
                 # v4 M2-dev: stem-addressing. The row-0 (ASI boundary row) query
                 # of the identity register would self-match the ASI column, which
@@ -140,7 +168,7 @@ class IdentityRegister(nn.Module):
                 # Deterministic: works the same at train and decode; default
                 # OFF (v3.3 unchanged).
                 u = (ids == self.user_id).float().argmax(-1)                # (B,) USER col
-                r = torch.where(have, idx, torch.full_like(idx, T)).squeeze(-1)  # (B,) ASI row
+                r = bound                                              # (B,) ASI row
                 a = a.clone()
                 for b in range(B):
                     ub, ab = u[b].item(), r[b].item()

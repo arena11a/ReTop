@@ -43,8 +43,10 @@ def build(sparse, device=None):
              n_layers=CFG["layers"], use_moe=False, gate_bias=CFG["gate_bias"],
              asi_id=tok.token_to_id("<|assistant|>"),
              aux_copy=True, sparse_marginal=sparse)
-    m.load_state_dict(torch.load(os.path.join(ROOT, "hmn_v33.pt"),
-                                 map_location=dev))
+    missing, unexpected = load_compat(m, os.path.join(ROOT, "hmn_v33.pt"),
+                                      device=dev)
+    assert not missing and not unexpected, \
+        f"checkpoint mismatch: missing={missing} unexpected={unexpected}"
     m.to(dev).eval()
     return m, tok, dev
 
