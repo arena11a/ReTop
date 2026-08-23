@@ -35,6 +35,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
+from hmn.checkpoint import load_compat
 from hmn.recipe import eval_slots, resolve_device
 
 CFG = dict(dim=96, layers=3, gate_bias=-1.0)
@@ -50,8 +51,8 @@ def load_model(checkpoint, device=None):
     dev = resolve_device(device)
     m = HMN3(tok.get_vocab_size(), dim=CFG["dim"], state_dim=8,
              n_layers=CFG["layers"], use_moe=False, gate_bias=CFG["gate_bias"],
-             asi_id=tok.token_to_id("<|assistant|>"), keys_proj=False, aux_copy=True)
-    m.load_state_dict(torch.load(checkpoint, map_location=dev))
+             asi_id=tok.token_to_id("<|assistant|>"), aux_copy=True)
+    load_compat(m, checkpoint, device=dev)
     m.to(dev).eval()
     return m, tok, dev
 

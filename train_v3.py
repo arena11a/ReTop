@@ -70,8 +70,7 @@ def build_model(arch, args, tok):
     if arch == "noreg":
         return HMN3_NoReg(vocab, dim=args.dim, state_dim=8, n_layers=args.layers)
     return HMN3(vocab, dim=args.dim, state_dim=8, n_layers=args.layers,
-                use_moe=args.moe, gate_bias=args.gate_bias, asi_id=asi_id(tok),
-                keys_proj=args.keys_proj, aux_copy=(arch == "v31"),
+                use_moe=args.moe, gate_bias=args.gate_bias, asi_id=asi_id(tok), aux_copy=(arch == "v31"),
                 sparse_marginal=args.sparse_marginal, gate_mode=args.gate_mode,
                 use_think=args.use_think, k_max=args.k_max, user_id=user_id(tok),
                 stem_addr=args.stem_addr)
@@ -109,7 +108,6 @@ def main():
                          "attention onto the USER column so the template's first token is "
                          "copyable (row-0 no longer forced through gen). Default off = v3.3")
     ap.add_argument("--moe", action="store_true")
-    ap.add_argument("--keys-proj", action="store_true")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", default="hmn_v31.pt")

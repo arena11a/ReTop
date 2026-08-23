@@ -19,7 +19,7 @@ import torch
 
 from tokenizers import Tokenizer
 
-from hmn import HMN, HMN_Option1, HMN3
+from hmn import HMN3
 from hmn.recipe import decode_v33, make_chat_ids, resolve_device
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -33,17 +33,6 @@ def build_tokenizer(path):
 
 def build_model(arch, args, tok):
     vocab = tok.get_vocab_size()
-    if arch == "v2":
-        return HMN(vocab, args.dim, args.state, args.layers,
-                   n_experts=16, top_k=2,
-                   n_mem_cells=args.mem_cells, mem_top_k=4,
-                   memory_interval=args.mem_interval)
-    if arch == "option1":
-        return HMN_Option1(vocab, dim=args.dim, state_dim=args.state,
-                           n_layers=args.layers, n_mem_cells=args.mem_cells,
-                           mem_top_k=4, beta_init=30.0, usage_decay=True,
-                           combined=args.combined, exempt_combined=args.exempt_combined,
-                           n_pairs=args.n_pairs, tie_weights=True)
     if arch == "v3":
         return HMN3(vocab, dim=args.dim, state_dim=args.state, n_layers=args.layers,
                     use_moe=args.moe, gate_bias=args.gate_bias,
@@ -56,27 +45,14 @@ def generate(model, tok, prompt_ids, max_new, arch="v2", device=None):
     """Greedy decode. v3 uses hmn/recipe.decode_v33 (blend of gen+copy with the
     boundary rule); legacy v2/option1 use softmax argmax."""
     dev = resolve_device(device)
-    if arch == "v3":
-        return decode_v33(model, tok, prompt_ids, max_new, device=dev)[0]
-    ids = list(prompt_ids)
-    eos = tok.token_to_id(EOS)
-    with torch.no_grad():
-        for _ in range(max_new):
-            inp = torch.tensor([ids], device=dev)
-            out = model(inp)
-            logits = out if isinstance(out, torch.Tensor) else out["logits"]
-            nxt = logits[0, -1].argmax(-1).item()
-            if nxt == eos:
-                break
-            ids.append(nxt)
-    return tok.decode(ids[len(prompt_ids):])
+    return decode_v33(model, tok, prompt_ids, max_new, device=dev)[0]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint", required=True, help=".pt state_dict to load")
-    ap.add_argument("--arch", default="v2", choices=["v2", "option1", "v3"])
+    ap.add_argument("--arch", default="v3", choices=["v3"])
     ap.add_argument("--tok", default=os.path.join(ROOT, "retop_tokenizer.json"))
     ap.add_argument("--dim", type=int, default=64)
     ap.add_argument("--state", type=int, default=8)
@@ -103,7 +79,7 @@ def main():
     tok = build_tokenizer(args.tok)
     model = build_model(args.arch, args, tok)
     try:
-        model.load_state_dict(torch.load(args.checkpoint, map_location=dev))
+        load_compat(model, args.checkpoint, device=dev)
     except RuntimeError as e:
         raise SystemExit(
             f"checkpoint does not match --arch {args.arch} config "

@@ -1,19 +1,19 @@
 """Helix Memory Network (HMN) — public API.
 
-v2  : reversible coupling backbone (SelectiveSSM) + product-key MoE +
-      DifferentiableEpisodicMemory. Verified 2026-08-07: single-token recall 97-99%,
-2-token recall 94-97% (multi-head).
-      recall 97-99% (single-token), 94-97% (multi-token), on random-query eval.
-v3  : dual-head decoder with Identity Register (hard copy lane) + optional latent
-      thinking buffer. PoC stage — the register solves slot-copy that a softmax
-      head alone cannot (see docs/hmn_v3_design.md).
+Core building blocks (v6 slim-down):
+  backbone  : SelectiveSSM + HelixCouplingBlock + ReversibleFunction +
+              SparseConditionalCompute (from hmn/v2.py)
+  v3        : IdentityRegister, DualHeadDecoder, SeedPointer, HMN3 — the
+              dual-register decoder with seam/stem run anchoring
+  checkpoint: load_compat shim for pre-v6 checkpoints (dead keys stripped)
+
+The full v2-era models (HMN, HMN_Option1, DifferentiableEpisodicMemory) were
+removed in v6; they live under git tag `v3.3` and the local legacy archive.
 """
 
+from hmn.checkpoint import load_compat
 from hmn.v2 import (
-    DifferentiableEpisodicMemory,
     HelixCouplingBlock,
-    HMN,
-    HMN_Option1,
     ReversibleFunction,
     SelectiveSSM,
     SparseConditionalCompute,
@@ -29,10 +29,7 @@ from hmn.v3 import (
 )
 
 __all__ = [
-    "DifferentiableEpisodicMemory",
     "HelixCouplingBlock",
-    "HMN",
-    "HMN_Option1",
     "ReversibleFunction",
     "SelectiveSSM",
     "SparseConditionalCompute",
@@ -43,6 +40,7 @@ __all__ = [
     "LatentThinkingBuffer",
     "RelativeGate",
     "SeedPointer",
+    "load_compat",
 ]
 
 __version__ = "0.5.0"

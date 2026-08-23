@@ -27,6 +27,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
+from hmn.checkpoint import load_compat
 from hmn.recipe import make_slot_batch, loss_v33, eval_slots, resolve_device
 
 TOKENIZER = os.path.join(ROOT, "retop_tokenizer.json")
@@ -40,7 +41,7 @@ def build(sparse, device=None):
     dev = resolve_device(device)
     m = HMN3(tok.get_vocab_size(), dim=CFG["dim"], state_dim=8,
              n_layers=CFG["layers"], use_moe=False, gate_bias=CFG["gate_bias"],
-             asi_id=tok.token_to_id("<|assistant|>"), keys_proj=False,
+             asi_id=tok.token_to_id("<|assistant|>"),
              aux_copy=True, sparse_marginal=sparse)
     m.load_state_dict(torch.load(os.path.join(ROOT, "hmn_v33.pt"),
                                  map_location=dev))

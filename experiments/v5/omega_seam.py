@@ -38,6 +38,7 @@ import torch.nn as nn
 from tokenizers import Tokenizer
 
 from hmn import HMN3
+from hmn.checkpoint import load_compat
 from hmn.recipe import (ASSIST, USER, CHAIN_SLOTS_A, CHAIN_SLOTS_A_U,
                         CHAIN_SLOTS_B, CHAIN_SLOTS_B_U, decode_v33,
                         eval_reorders, eval_slot_chains, loss_v33,
@@ -267,7 +268,7 @@ def run_seed(seed, tok, args, dev):
     torch.manual_seed(seed)
     model = build_model(tok, args).to(dev)
     if args.init:
-        model.load_state_dict(torch.load(args.init, map_location=dev))
+        load_compat(model, args.init, device=dev)
         print(f"resumed from {args.init}", flush=True)
     print(f"== M1 seam ON seed={seed}, "
           f"params={sum(p.numel() for p in model.parameters()):,} ==")
@@ -356,7 +357,7 @@ def main():
         # slot_v33_seed42.py stay green (bit-identical). joint/joint3 runs
         # carry their own chain eval in the training loop instead.
         model = build_model(tok, args).to(dev)
-        model.load_state_dict(torch.load(args.save, map_location=dev))
+        load_compat(model, args.save, device=dev)
         ch_acc, ch_gate, _ = eval_slot_chains(
             model, tok, CHAIN_SLOTS_A_U[:10], CHAIN_SLOTS_B_U[:10], seed=9,
             boundary_eos=True, cycle_break=True, pos_eos=True, device=dev)

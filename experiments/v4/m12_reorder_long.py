@@ -29,8 +29,7 @@ def main():
     seed_guardrail(42)
     torch.manual_seed(42)
     m = HMN3(tok.get_vocab_size(), dim=96, state_dim=8, n_layers=3,
-             use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"),
-             keys_proj=False, aux_copy=True, sparse_marginal=True,
+             use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"), aux_copy=True, sparse_marginal=True,
              gate_mode="deterministic", use_think=False, k_max=4,
              user_id=tok.token_to_id("<|user|>"), stem_addr=False)
     opt = torch.optim.AdamW(m.parameters(), lr=1e-3)

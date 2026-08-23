@@ -148,7 +148,7 @@ def train_steps(model, opt, tok, steps, bs, templates, desc, device=None):
                                       device=device)
         opt.zero_grad()
         out = model(X)
-        if isinstance(model, (HMN3,)):
+        if isinstance(model, (HMN3)):
             logits = out["logits"]
             criteria = nn.CrossEntropyLoss(ignore_index=-100)
             loss = criteria(logits.reshape(-1, logits.shape[-1]), Y.reshape(-1))
@@ -192,8 +192,7 @@ def main():
     print(f"vocab={vocab} templates={len(tpls)} steps={args.steps} device={dev}")
 
     hmn = HMN3(vocab, dim=96, state_dim=8, n_layers=3,
-               use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"),
-               keys_proj=False, aux_copy=True, sparse_marginal=True,
+               use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"), aux_copy=True, sparse_marginal=True,
                gate_mode="deterministic", use_think=False, k_max=4,
                user_id=tok.token_to_id("<|user|>"), stem_addr=True).to(dev)
     noreg = HMN3_NoReg(vocab, dim=96, state_dim=8, n_layers=3).to(dev)

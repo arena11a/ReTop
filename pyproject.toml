@@ -17,6 +17,8 @@ dependencies = [
 [project.optional-dependencies]
 gui = ["gradio>=4"]
 exps = ["matplotlib", "numpy"]
+hf = ["transformers>=4.40", "accelerate>=0.30", "datasets>=2.19"]
+scale = ["triton>=3.0", "deepspeed>=0.14"]
 
 [project.scripts]
 retop = "retop:main"

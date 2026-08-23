@@ -119,8 +119,7 @@ def main():
 
     for stem in (False, True):
         m = HMN3(vocab, dim=96, state_dim=8, n_layers=3,
-                 use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"),
-                 keys_proj=False, aux_copy=True, sparse_marginal=True,
+                 use_moe=False, gate_bias=0.0, asi_id=tok.token_to_id("<|assistant|>"), aux_copy=True, sparse_marginal=True,
                  gate_mode="deterministic", use_think=False, k_max=4,
                  user_id=tok.token_to_id("<|user|>"), stem_addr=stem)
         opt = torch.optim.AdamW(m.parameters(), lr=1e-3)

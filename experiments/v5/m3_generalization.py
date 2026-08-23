@@ -31,6 +31,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
+from hmn.checkpoint import load_compat
 from hmn.recipe import (ASSIST, USER, decode_rotate, decode_v33,
                         make_perm_ids, resolve_device, seed_guardrail)
 
@@ -86,7 +87,7 @@ def main():
                  n_layers=args.layers, use_moe=False, gate_bias=-1.0,
                  asi_id=tok.token_to_id(ASSIST),
                  user_id=tok.token_to_id(USER), seam_addr=True)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=dev))
+    load_compat(model, args.checkpoint, device=dev)
     model.to(dev).eval()
     print(f"loaded {args.checkpoint} "
           f"({sum(p.numel() for p in model.parameters()):,} params) on {dev}")

@@ -29,6 +29,7 @@ import torch
 
 from tokenizers import Tokenizer
 
+from hmn.checkpoint import load_compat
 from hmn.recipe import decode_v33, make_chat_ids, resolve_device
 from retop import SPECS, build_model as retop_build_model
 
@@ -237,7 +238,7 @@ def load_chat(ckpt_path, tok_path, dim, layers, gate_bias, max_new, mode):
     try:
         model = retop_build_model(cfg.get("arch", "v3"), cfg, tok)
         dev = resolve_device()
-        model.load_state_dict(torch.load(ckpt_path, map_location=dev))
+        load_compat(model, ckpt_path, device=dev)
         model.to(dev).eval()
         CHAT["device"] = dev
     except Exception as e:

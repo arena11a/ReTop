@@ -57,8 +57,7 @@ def main():
     tok = Tokenizer.from_file(TOKENIZER)
     dev = resolve_device()
     m = HMN3(tok.get_vocab_size(), dim=96, state_dim=8, n_layers=3,
-             use_moe=False, gate_bias=0.0, asi_id=tv.asi_id(tok),
-             keys_proj=False, aux_copy=True, sparse_marginal=True,
+             use_moe=False, gate_bias=0.0, asi_id=tv.asi_id(tok), aux_copy=True, sparse_marginal=True,
              gate_mode="deterministic", use_think=False, k_max=4,
              user_id=tok.token_to_id("<|user|>"), stem_addr=False)
     m.load_state_dict(torch.load("/tmp/opencode/m4_c2b_nothink.pt",

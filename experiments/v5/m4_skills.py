@@ -32,6 +32,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn import HMN3
+from hmn.checkpoint import load_compat
 from hmn import skills as S
 from hmn.recipe import (ASSIST, CHAIN_SLOTS_A_U, USER, eval_slots,
                         make_chat_ids, make_perm_ids, resolve_device,
@@ -147,7 +148,7 @@ def main():
     seed_guardrail(42)
     tok = Tokenizer.from_file(TOKENIZER)
     model = build_model(tok)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=dev))
+    load_compat(model, args.checkpoint, device=dev)
     model.to(dev).eval()
     print(f"loaded {args.checkpoint} on {dev}")
 

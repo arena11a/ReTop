@@ -38,6 +38,7 @@ import torch.nn as nn
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 from hmn import HMN3, HMN3_NoReg
+from hmn.checkpoint import load_compat
 from hmn.recipe import (decode_v33, loss_v33, make_chat_ids, make_chat_targets,
                         resolve_device, seed_guardrail)
 
@@ -314,7 +315,7 @@ def chat(args):
     tok = Tokenizer.from_file(cfg["tokenizer"])
     model = build_model(cfg.get("arch", "v3"), cfg, tok)
     dev = resolve_device(args.device)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=dev))
+    load_compat(model, args.checkpoint, device=dev)
     model.to(dev).eval()
     print(f"loaded {cfg.get('arch', 'v3')} ({sum(p.numel() for p in model.parameters()):,} "
           f"params, spec={cfg.get('spec')}) from {args.checkpoint}", flush=True)
