@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retop-hmn"
-version = "0.3.0"
+version = "0.5.0"
 description = "Helix Memory Network — reversible coupling + MoE + episodic memory language model (CPU-trainable)"
 readme = "README.md"
 requires-python = ">=3.9"

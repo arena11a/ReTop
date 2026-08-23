@@ -166,6 +166,7 @@ def main():
         print(f"  {k:<24} {v:.3f}  ({mark}, criterion {crit[k]:.2f})")
     print("M3 ALL PROBES PASSED" if allpass else "M3: some probes missed "
           "(document honestly; see roadmap)")
+    sys.exit(0 if allpass else 1)
 
 
 if __name__ == "__main__":
