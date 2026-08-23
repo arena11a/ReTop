@@ -37,3 +37,17 @@ jobs:
 
       - name: v4 chain guardrail (pos_eos, 5 seeds + 3-slot length-gen)
         run: python experiments/verified/chain_v4.py 60
+
+      - name: Download v5 checkpoint (release asset)
+        run: |
+          curl -sL https://github.com/arena11a/ReTop/releases/download/v5/omega_cur2.pt -o omega_cur2.pt
+          ls -la omega_cur2.pt
+
+      - name: v5 seam smoke (M1 plumbing regression, 10 steps)
+        run: python experiments/v5/omega_seam.py --skip-m0 --skip-regression --steps 10 --eval-every 10 --save /tmp/omega_ci_smoke.pt
+
+      - name: v5 M3 generalization probes (rotation/held-out/len-gen, must be 20/20)
+        run: python experiments/v5/m3_generalization.py --checkpoint omega_cur2.pt --suite cur --n 20
+
+      - name: v5 M4 skill library (distill/retrieve/execute)
+        run: python experiments/v5/m4_skills.py --checkpoint omega_cur2.pt --n 5

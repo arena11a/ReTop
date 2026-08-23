@@ -213,6 +213,7 @@ def main():
         print(f"  {k:<8} {v:.3f} ({mark}, criterion {crit[k]:.2f})")
     print("M4 ALL CRITERIA PASSED" if allpass else
           "M4: some criteria missed (document honestly)")
+    sys.exit(0 if allpass else 1)
 
 
 if __name__ == "__main__":
