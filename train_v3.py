@@ -69,11 +69,14 @@ def build_model(arch, args, tok):
     vocab = tok.get_vocab_size()
     if arch == "noreg":
         return HMN3_NoReg(vocab, dim=args.dim, state_dim=8, n_layers=args.layers)
+    # v6 M1-B: the v31 recipe consumes the IRStats API; other archs keep the
+    # legacy dense blended logits for their plain-CE branch.
     return HMN3(vocab, dim=args.dim, state_dim=8, n_layers=args.layers,
                 use_moe=args.moe, gate_bias=args.gate_bias, asi_id=asi_id(tok), aux_copy=(arch == "v31"),
                 sparse_marginal=args.sparse_marginal, gate_mode=args.gate_mode,
                 use_think=args.use_think, k_max=args.k_max, user_id=user_id(tok),
-                stem_addr=args.stem_addr)
+                stem_addr=args.stem_addr,
+                exact_blend=args.exact_blend or arch != "v31")
 
 
 def main():
@@ -107,6 +110,9 @@ def main():
                     help="v4 M2-dev: stem-addressing — anchor the ASI boundary row's copy "
                          "attention onto the USER column so the template's first token is "
                          "copyable (row-0 no longer forced through gen). Default off = v3.3")
+    ap.add_argument("--exact-blend", action="store_true",
+                    help="v6 M1-B: force the legacy dense blended-logits oracle path "
+                         "(default: IRStats index path for the v31 recipe)")
     ap.add_argument("--moe", action="store_true")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--seed", type=int, default=0)

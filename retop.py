@@ -233,7 +233,8 @@ def build_model(arch, cfg, tok):
                           n_layers=cfg["layers"])
     return HMN3(cfg["vocab"], dim=cfg["dim"], state_dim=8,
                 n_layers=cfg["layers"], use_moe=cfg["moe"],
-                gate_bias=cfg["gate_bias"], asi_id=asi, aux_copy=True)
+                gate_bias=cfg["gate_bias"], asi_id=asi, aux_copy=True,
+                exact_blend=cfg.get("exact_blend", False))
 
 
 def train(args, cfg):
@@ -241,6 +242,7 @@ def train(args, cfg):
     tok = Tokenizer.from_file(args.tok)
     vocab = tok.get_vocab_size()
     cfg.update(vocab=vocab, arch=args.arch, seed=args.seed, spec=args.spec,
+               exact_blend=getattr(args, "exact_blend", False),
                tokenizer=os.path.abspath(args.tok))
     model = build_model(args.arch, cfg, tok)
     n_params = sum(p.numel() for p in model.parameters())
@@ -282,7 +284,10 @@ def train(args, cfg):
                     break
                 with torch.no_grad():
                     out = model(X)
-                    logits = out if isinstance(out, torch.Tensor) else out["logits"]
+                    # v6 M1-B: stats path has no blended logits — val metric
+                    # falls back to the gen head (same scale, log-probs).
+                    logits = out if isinstance(out, torch.Tensor) \
+                        else out.get("logits", out["gen_logits"])
                     m = Y != -100
                     if m.sum() == 0:
                         continue
@@ -360,6 +365,9 @@ def main():
     p.add_argument("--steps", type=int, default=None, help="override spec steps")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--w-copy", type=float, default=1.0)
+    p.add_argument("--exact-blend", action="store_true",
+                   help="v6 M1-B: legacy dense blended-logits oracle instead of "
+                        "the IRStats index path")
     p.add_argument("--eval-every", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(fn=train, eval_every=None)

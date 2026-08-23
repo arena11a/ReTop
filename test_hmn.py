@@ -8,6 +8,7 @@ Covers the pieces the data-generator tests don't:
 
 Run: python test_hmn.py        (CPU, a few seconds)
 """
+import math
 import os
 import sys
 
@@ -87,14 +88,14 @@ def test_v3_forward_and_copy():
     m = HMN3(VOCAB, dim=96, state_dim=8, n_layers=3, use_moe=False,
              gate_bias=-2.0, asi_id=5)
     out = m(rand_ids())
-    check("logits" in out and "g" in out and "copy_dist" in out, "returns logits/g/copy_dist")
-    check(out["logits"].shape == (2, 16, VOCAB), "logits shape")
-    check(out["copy_dist"].shape == (2, 16, VOCAB), "copy_dist shape")
-    check(torch.isfinite(out["logits"]).all(), "logits finite")
-    # copy_dist is a probability distribution over vocab
-    check(torch.allclose(out["copy_dist"].sum(-1), torch.ones(2, 16), atol=1e-3),
-          "copy_dist sums to 1 per position")
-    # backward incl. aux copy loss (via the v3.3 recipe, NOT CE-on-probs)
+    # v6 M1-B: the default forward returns the IRStats API — NO dense blended
+    # "logits" / "copy_dist" (those are oracle-only behind exact_blend=True).
+    check("stats" in out and "gen_logits" in out and "g" in out,
+          "returns stats/gen_logits/g")
+    check(not hasattr(out["stats"], "attn"), "stats carries no dense attention")
+    check(out["gen_logits"].shape == (2, 16, VOCAB), "gen_logits shape")
+    check(torch.isfinite(out["gen_logits"]).all(), "gen_logits finite")
+    # backward incl. aux copy loss (via the v3.3 recipe on the stats API)
     Y = rand_ids()
     Yc = Y.clone()
     Yc[:, 0] = -100
@@ -105,6 +106,14 @@ def test_v3_forward_and_copy():
     n_grad = sum(1 for p in m.parameters() if p.grad is not None)
     check(n_grad > 0, f"gradients reached {n_grad} params")
     check(torch.isfinite(loss), "loss_v33 finite")
+    # oracle regime (--exact-blend): legacy dense contract preserved
+    mo = HMN3(VOCAB, dim=96, state_dim=8, n_layers=3, use_moe=False,
+              gate_bias=-2.0, asi_id=5, exact_blend=True)
+    oo = mo(rand_ids())
+    check(oo["logits"].shape == (2, 16, VOCAB), "oracle logits shape")
+    check(oo["copy_dist"].shape == (2, 16, VOCAB), "oracle copy_dist shape")
+    check(torch.allclose(oo["copy_dist"].sum(-1), torch.ones(2, 16), atol=1e-3),
+          "oracle copy_dist sums to 1 per position")
 
 
 def test_v3_noreg_and_think():
@@ -115,7 +124,7 @@ def test_v3_noreg_and_think():
     t = HMN3(VOCAB, dim=96, state_dim=8, n_layers=3, use_think=True, k_max=4,
              use_moe=False, gate_bias=-2.0, asi_id=5)
     out = t(rand_ids())
-    check(torch.isfinite(out["logits"]).all(), "thinking-buffer logits finite")
+    check(torch.isfinite(out["gen_logits"]).all(), "thinking-buffer gen_logits finite")
 
 
 def test_moe_aux_loss():
@@ -260,9 +269,10 @@ def test_seam_anchor_none_parity():
     with torch.no_grad():
         o1 = m(x)
         o2 = m(x, seam_anchor=torch.full_like(x, -100))
-    check(torch.equal(o1["logits"], o2["logits"]), "logits identical")
-    check(torch.equal(o1["copy_dist"], o2["copy_dist"]), "copy_dist identical")
+    check(torch.equal(o1["gen_logits"], o2["gen_logits"]), "gen_logits identical")
     check(torch.equal(o1["g"], o2["g"]), "gate identical")
+    check(torch.equal(o1["stats"].mass_same, o2["stats"].mass_same),
+          "stats mass_same identical")
 
 
 def test_v6_m1a_index_stats():
@@ -316,6 +326,85 @@ def test_v6_m1a_index_stats():
     anchor[0, 11] = 3
     *_, ms_seam, _ = ir._attn(table[ids[:1]], ids[:1], seam_anchor=anchor)
     check(ms_seam[0, 11].item() == 1.0, "seam-forced row keeps mass_same=1.0")
+
+
+def test_v6_m1b_stats_vs_oracle():
+    print("[v6 M1-B: IRStats index path == dense oracle (losses + decode)]")
+    torch.manual_seed(7)
+    mo = HMN3(VOCAB, dim=48, state_dim=8, n_layers=2, use_moe=False,
+              gate_bias=-1.0, asi_id=5)
+    ms = HMN3(VOCAB, dim=48, state_dim=8, n_layers=2, use_moe=False,
+              gate_bias=-1.0, asi_id=5)
+    ms.load_state_dict(mo.state_dict())          # identical weights
+    # realistic slot-style batch: the answer repeats prompt tokens so the copy
+    # lane carries REAL twin mass (not just cross-id epsilon), which is what
+    # trained workloads look like
+    ids = torch.tensor([[100, 201, 202, 203, 204, 205, 206, 5,
+                         202, 203, 204, 205, 206, 1]])
+    X = ids
+    T = ids.shape[1]
+    Y = ids.roll(-1, dims=1).clone()
+    Y[:, :7] = -100                              # targets live in answer rows
+    Yc = Y.clone()
+    Yc[0, 7] = -100                              # first answer row: seed only
+    Yc[0, T - 1] = -100                          # EOS not copyable
+    G = torch.zeros(1, T)
+    G[0, 8:T - 1] = 1.0
+    with torch.no_grad():
+        od = mo(X, exact_blend=True)
+        os_ = ms(X)
+        st = os_["stats"]
+        # gate inputs / ctx are a LOSSLESS group-space collapse of the oracle
+        x_emb = mo.embed(X)
+        _, _, n_legal_o, ctx_o, behind_o, gm_o, _ = mo.ir._attn(x_emb, X)
+        check(torch.equal(st.n_legal, n_legal_o), "n_legal == oracle")
+        check(torch.equal(st.behind, behind_o), "behind == oracle")
+        gm_err = (st.mass_same - gm_o).abs().max().item()
+        check(gm_err < 1e-4, f"mass_same == oracle ({gm_err:.2e})")
+        # ctx: EXACT at answer rows (the only rows loss/decode read); prompt
+        # rows use the documented full-group segment mean
+        bound_t = 7
+        arow = torch.arange(T).unsqueeze(0) >= bound_t
+        ctx_err = (st.ctx - ctx_o)[arow].abs().max().item()
+        check(ctx_err < 1e-3,
+              f"ctx == attention blend at answer rows ({ctx_err:.2e})")
+        ld = loss_v33(od, Y, Yc, G)
+        ls = loss_v33(os_, Y, Yc, G)
+    names = ["total", "blend", "gen", "copy"]
+    tols = [2e-3, 2e-3, 1e-5, 1e-3]
+    for nme, a, b, tol in zip(names[2:], ld[2:], ls[2:], tols[2:]):
+        d = abs(float(a) - float(b))
+        check(d < tol, f"{nme} CE parity ({d:.2e} < {tol:.0e})")
+    # gen/copy CE match tightly on ANY batch; the BLEND term additionally
+    # matches row-by-row wherever the blend probability sits above the
+    # oracle's own eps floor (p.clamp(min=1e-8) inside DualHeadDecoder) — an
+    # untrained head pushes garbage rows below that floor. End-to-end blend
+    # parity on a TRAINED checkpoint lives in experiments/v4/m1_sparse_parity.
+    with torch.no_grad():
+        lo_rows = od["logits"].squeeze(0)          # oracle blended log-probs
+        g_s = os_["g"].squeeze(-1)[0]
+        pc_r = st.prob_at(Yc)[0]
+        lg_y = os_["gen_logits"][0].gather(1, Y.squeeze(0).clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        lp_c = torch.full_like(pc_r, float("-inf"))
+        nzr = pc_r > 0
+        lp_c[nzr] = pc_r[nzr].log()
+        import math as _m
+        ok_rows = 0
+        for t in range(Y.shape[1]):
+            y = int(Y[0, t])
+            if y == -100 or float(lo_rows[t, y]) <= math.log(1e-8) + 1e-4:
+                continue                           # floored by the oracle itself
+            gc = float(g_s[t])
+            a_ = math.log(max(1 - gc, 1e-12)) + float(lg_y[t])
+            b_ = math.log(max(gc, 1e-12)) + float(lp_c[t])
+            l_st = -(max(a_, b_) + _m.log(_m.exp(min(a_, b_) - max(a_, b_)) + 1))
+            check(abs(l_st - float(lo_rows[t, y])) < 2e-2,
+                  f"blend row {t} parity ({l_st:.4f} vs {float(lo_rows[t, y]):.4f})")
+            ok_rows += 1
+    check(ok_rows >= 4, f"enough above-floor blend rows compared ({ok_rows})")
+    p = st.prob_at(Yc)
+    check(bool(((p >= 0) & (p <= 1 + 1e-5)).all()), "prob_at in [0,1]")
+    check(float(p[0, 9]) > 0.4, f"copy target probability sharp ({float(p[0, 9]):.3f})")
 
 
 def test_reorder_anchors_and_batch():
@@ -418,6 +507,7 @@ if __name__ == "__main__":
     test_recipe_cycle_break_self_pair()
     test_seam_anchor_none_parity()
     test_v6_m1a_index_stats()
+    test_v6_m1b_stats_vs_oracle()
     test_reorder_anchors_and_batch()
     test_decode_seam_mechanics()
     test_skills_recipes_and_coverage()

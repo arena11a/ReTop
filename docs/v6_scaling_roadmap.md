@@ -53,15 +53,28 @@ Phased commits (each keeps CI green):
   Also fixed: `experiments/v4/m1_sparse_parity.py` now actually uses
   `load_compat` (imported-but-unused since M0.5 → strict load crashed on the
   legacy checkpoint).
-- **B. consumer migration**: introduce `IRStats` container (CSR grouped by
-  value-id: legal member positions ascending + cumcounts; per-group payload
-  histograms via flattened (b,gid,payload) sort) replacing raw `a` in:
-  `loss_v33` copy branch (`stats.prob_at(Yc)`), blend CE via exact
-  `logaddexp(log(1-g)+gen_logp[y], log g+copy_logp[y])`, gate inputs,
-  ctx (segment-mean), decode copy-argmax (per-group payload MODE table).
-  `out["logits"]` dense-shape becomes oracle-only (`--exact-blend`);
-  trainers/decode consume the stats API. Tests asserting dense shapes are
-  updated with documented rationale.
+- **B. consumer migration** ✅ 2026-08-23: `IRStats` (`hmn/v3.py`) replaces
+  every consumer's access to the dense attention: gate inputs and ctx come
+  from a LOSSLESS group-space collapse (attention sims are constant within a
+  token group, so the (B,T,T) column space shrinks onto (B,T,G), G = distinct
+  ids — mass_same/n_legal/behind/ctx match the oracle to FP noise); the copy
+  lane reads OWN-GROUP payload histograms over a flattened (b,gid,payload)
+  sort — `prob_at(Yc)` for the loss, per-group payload MODE table for decode,
+  `payloads_of()` slices for the exact logaddexp blend argmax over
+  {gen ∪ payloads}. `loss_v33` evaluates the convex blend per-target via
+  exact `logaddexp(log(1-g)+gen_logp[y], log g+copy_logp[y])` — no (B,T,V)
+  blend tensor; `out["logits"]` is now oracle-only (`exact_blend=True`,
+  `--exact-blend`). Forced rows (stem/seam anchors) expose their anchored
+  payload as the single copy candidate at p=1.0 (one-hot semantics).
+  DECLARED semantic change (release note): cross-id ε-mass dropped
+  ("twins-uniform snap") — exact at answer rows; prompt-row ctx uses the
+  full-group segment mean (unconsumed downstream). Measured @T=2048 B=1:
+  forward peak-RSS 1299 MB (oracle) vs **349 MB (stats)**; parity on the
+  trained v3.3 ckpt: gate diff 0.0, gen logits 3e-05, 40/40 both paths with
+  identical gate traces; ALL guardrails green zero-shot through the stats
+  decode (slot_v4/chain_v4 1.000, v5 M3 20/20, M4 all PASS). Legacy plain-CE
+  guardrail trainers (slot_v4/chain_v4) keep their historical math via the
+  oracle at train time and exercise the stats path at decode.
 - **C. decode candidate scheme**: blend argmax over {gen top-k ∪ copy mode}
   proven exact via probability bounds; (B,T,V) survives only in
   `(B,T,V_gen_head)` which is the model output itself (irreducible, §6 note).

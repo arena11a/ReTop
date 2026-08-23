@@ -37,7 +37,8 @@ def build_model(arch, args, tok):
         return HMN3(vocab, dim=args.dim, state_dim=args.state, n_layers=args.layers,
                     use_moe=args.moe, gate_bias=args.gate_bias,
                     use_think=args.think, k_max=args.k_max,
-                    asi_id=tok.token_to_id(ASI))
+                    asi_id=tok.token_to_id(ASI),
+                    exact_blend=args.exact_blend)
     raise ValueError(f"unknown --arch {arch!r}")
 
 
@@ -66,6 +67,9 @@ def main():
     ap.add_argument("--gate-bias", type=float, default=0.0)
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--k-max", type=int, default=4)
+    ap.add_argument("--exact-blend", action="store_true",
+                    help="v6 M1-B: legacy dense blended-logits oracle instead of "
+                         "the IRStats index path")
     ap.add_argument("--prompt", default=None, help="one-shot prompt")
     ap.add_argument("--interactive", action="store_true", help="REPL loop")
     ap.add_argument("--max-new", type=int, default=64)

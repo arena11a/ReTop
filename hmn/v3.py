@@ -201,6 +201,56 @@ class IdentityRegister(nn.Module):
                         mass_same[b, t] = 1.0
         return a, nxt, n_legal, ctx, behind, mass_same, mask
 
+    def _forced_columns(self, ids, seam_anchor=None):
+        """Anchor overrides as a (B,T) column tensor (-100 = free row).
+
+        Replicates the stem-addr / omega-seam loops of _attn EXACTLY (same
+        guards, same iteration order): seam anchors take precedence and skip
+        stem-addr entirely; stem echo runs from the ASI row while its payload
+        stays inside the prompt region.
+        """
+        B, T = ids.shape
+        forced = torch.full((B, T), -100, dtype=torch.long, device=ids.device)
+        if seam_anchor is not None:
+            for b in range(B):
+                for t in range(T):
+                    c = int(seam_anchor[b, t].item())
+                    if c >= 0:
+                        forced[b, t] = c
+            return forced
+        if (self.stem_addr and self.user_id is not None
+                and self.asi_id is not None
+                and (ids == self.asi_id).any()
+                and (ids == self.user_id).any()):
+            u = (ids == self.user_id).float().argmax(-1)          # (B,) USER col
+            idx = (ids == self.asi_id).float().argmax(-1)         # (B,) ASI row
+            have = (ids == self.asi_id).any(-1)
+            r = torch.where(have, idx, torch.full_like(idx, T)).long()
+            for b in range(B):
+                ub, ab = u[b].item(), r[b].item()
+                for t in range(ab, T):
+                    c = ub + (t - ab)
+                    if c + 1 >= ab:
+                        break
+                    forced[b, t] = c
+        return forced
+
+    def stats(self, keys, ids, seam_anchor=None):
+        """v6 M1-B: build the IRStats index container (no T^2/T*V tensors)."""
+        B = ids.shape[0]
+        pos = torch.arange(ids.shape[1], device=ids.device)
+        bound = torch.full((B,), ids.shape[1], device=ids.device,
+                           dtype=torch.long)
+        if self.asi_id is not None and (ids == self.asi_id).any():
+            idx = (ids == self.asi_id).float().argmax(-1)
+            have = (ids == self.asi_id).any(-1)
+            bound = torch.where(have, idx,
+                                torch.full_like(idx, ids.shape[1])).long()
+        forced = self._forced_columns(ids, seam_anchor)
+        return IRStats(ids=ids, keys=keys, beta=self.beta.abs() + 1.0,
+                       bound=bound, forced=forced, vocab=self.vocab,
+                       asi_id=self.asi_id, eos_id=self.eos_id)
+
     def forward(self, keys, ids, query, return_attn=False, seam_anchor=None):
         # keys:  (B, T, dim) RAW token embeddings (identity lane, addressing)
         # ids:   (B, T) raw token ids (payload)
@@ -231,6 +281,209 @@ class IdentityRegister(nn.Module):
 
     def set_vocab(self, v):
         self.vocab = v
+
+
+class IRStats:
+    """v6 M1-B: register statistics read off the token inverted index.
+
+    Replaces every consumer's access to the dense position attention `a`:
+
+      gate inputs  mass_same / n_legal / behind — EXACT vs the dense path:
+          attention similarity is constant within a token group (raw-embed
+          self-match), so the (B, T, T) column space collapses LOSSLESSLY onto
+          a (B, T, G) group space (G = distinct ids): the row normalizer, the
+          softmax weights and the same-id mass are reproduced bit-close while
+          never materializing T^2.
+      ctx          raw-key segment means weighted by the same group weights —
+          EXACT at answer rows t >= bound (where every consumer reads it).
+          Prompt rows use the full-group segment mean instead of the <=t
+          truncation (documented approximation; nothing consumes them).
+      copy lane    OWN-GROUP payload histograms over a flattened
+          (b, gid, payload) sort: p_copy(y | t) = hist_g[t][y] / C_g. This is
+          the DECLARED semantic change of M1 (release-note item): cross-id
+          epsilon-mass is dropped ("twins-uniform snap"). Exact at answer rows
+          t >= bound; prompt rows carry the full-group histogram (unconsumed
+          downstream: losses and decode read answer rows only).
+      decode       per-group payload MODE table (= argmax of the snapped copy
+          distribution, ties -> smallest id like torch.argmax) plus
+          payloads_of() slices for the exact blend argmax.
+
+    Forced rows (stem-addr / omega-seam anchors) open the gate (mass_same=1),
+    leave `behind` False and pin p_copy onto the anchored payload — matching
+    the dense path, which mutates `a` AFTER ctx was computed (ctx keeps the
+    identity-fallback value there, deliberately).
+    """
+
+    def __init__(self, ids, keys, beta, bound, forced, vocab, asi_id, eos_id):
+        B, T = ids.shape
+        dev = ids.device
+        D = keys.shape[-1]
+        self.B, self.T, self.vocab, self.G = B, T, vocab, None
+        pos = torch.arange(T, device=dev)
+        nxt_col = torch.cat([ids[:, 1:], torch.full_like(ids[:, :1], -1)], dim=1)
+        bad_payload = (nxt_col == asi_id) | (nxt_col == eos_id) | (nxt_col == -1)
+        col_ok = (pos.unsqueeze(0) < bound.unsqueeze(-1)) & ~bad_payload
+        self.n_legal = col_ok.cumsum(-1)                        # (B,T)
+        behind = torch.zeros(B, T, dtype=torch.bool, device=dev)
+        if asi_id is not None and (ids == asi_id).any():
+            behind = pos.unsqueeze(0) <= bound.unsqueeze(-1)
+
+        # token groups: stable sort keeps member positions ascending
+        sids, perm = ids.sort(dim=-1, stable=True)
+        grp_sorted = torch.cat(
+            [torch.ones(B, 1, dtype=torch.bool, device=dev),
+             sids[:, 1:] != sids[:, :-1]], 1).cumsum(-1) - 1
+        G = int(grp_sorted.max()) + 1
+        self.G = G
+        col_grp = torch.empty_like(grp_sorted).scatter_(1, perm, grp_sorted)
+        self.col_grp = col_grp                                  # (B,T) group/column
+        rep_slot = torch.searchsorted(
+            grp_sorted.contiguous(),
+            torch.arange(G, device=dev).unsqueeze(0).expand(B, G).contiguous(),
+            side="left").clamp(max=T - 1)   # rows with fewer groups: unused
+        rep_col = perm.gather(1, rep_slot)                      # first member col
+        # representatives must be normalized EXACTLY like _attn's ek lane
+        # (within a group every member shares one vector, so this is exact)
+        Krep = F.normalize(keys.gather(1, rep_col.unsqueeze(-1).expand(B, G, D)),
+                           dim=-1)
+
+        # ---- (B,T,G) group space: lossless collapse of the dense attention
+        H = torch.zeros(B, T, G, device=dev)
+        H.scatter_(2, col_grp.unsqueeze(-1), col_ok.float().unsqueeze(-1))
+        C = H.cumsum(1)                                         # legal members <=t
+        qk = F.normalize(keys, dim=-1)
+        sim = (qk @ Krep.transpose(1, 2)) * beta                # (B,T,G)
+        logC = C.clamp(min=1).log()
+        tot = logC + sim.masked_fill(C == 0, float("-inf"))
+        lse = tot.logsumexp(-1)                                 # (B,T) normalizer
+        w = torch.exp(tot - lse.unsqueeze(-1))                  # rows sum to 1
+        self.mass_same = w.gather(2, col_grp.unsqueeze(-1)).squeeze(-1)
+        seg = torch.zeros(B, G, D, device=dev)
+        seg.scatter_add_(1, col_grp.unsqueeze(-1).expand(B, T, D),
+                         keys * col_ok.unsqueeze(-1).float())
+        denom = torch.zeros(B, G, device=dev).scatter_add_(1, col_grp,
+                                                          col_ok.float())
+        self.denom = denom                                      # full ok count/group
+        self.ctx = torch.matmul(w, seg / denom.clamp(min=1.0).unsqueeze(-1))
+
+        self.forced = forced                                    # (B,T) long, -100 none
+        self.behind = behind & ~(forced >= 0)
+        self.mass_same = torch.where(forced >= 0,
+                                     torch.ones_like(self.mass_same),
+                                     self.mass_same)
+        self.anchor_pay = torch.full((B, T), -100, dtype=torch.long, device=dev)
+        fm = forced >= 0
+        if fm.any():
+            self.anchor_pay[fm] = torch.gather(
+                nxt_col, 1, forced.clamp(min=0))[fm]
+
+        # ---- payload histogram runs over OK columns, keyed (b*G+g)*V+y ----
+        sel = col_ok.reshape(-1).nonzero(as_tuple=True)[0]
+        if sel.numel():
+            fb = sel // T
+            key = ((fb * G + col_grp.reshape(-1)[sel]) * vocab
+                   + nxt_col.reshape(-1)[sel])
+            key, order = key.sort()
+            starts = torch.ones(key.numel(), dtype=torch.bool, device=dev)
+            starts[1:] = key[1:] != key[:-1]
+            self.h_key = key                                    # sorted, unique
+            self.h_bnd = starts.nonzero(as_tuple=True)[0]
+            self.h_cnt = torch.diff(torch.cat(
+                [self.h_bnd, torch.tensor([key.numel()], device=dev)]))
+            rkey = self.h_key[self.h_bnd]
+            self.h_b = rkey // (G * vocab)
+            rem = rkey % (G * vocab)
+            self.h_g = rem // vocab
+            self.h_y = rem % vocab
+            # MODE per group: cnt desc (stable) keeps payload asc on ties
+            om = self.h_cnt.sort(descending=True, stable=True)[1]
+            rb, rg, ry, rc = (self.h_b[om], self.h_g[om],
+                              self.h_y[om], self.h_cnt[om])
+            first = torch.ones(rb.numel(), dtype=torch.bool, device=dev)
+            first[1:] = (rb[1:] != rb[:-1]) | (rg[1:] != rg[:-1])
+            m_idx = rb[first] * G + rg[first]
+            self.mode_val = torch.full((B * G,), -100, dtype=torch.long,
+                                       device=dev)
+            self.mode_val[m_idx] = ry[first]
+            self.mode_cnt = torch.zeros(B * G, dtype=torch.long, device=dev)
+            self.mode_cnt[m_idx] = rc[first]
+        else:
+            self.h_key = torch.zeros(0, dtype=torch.long, device=dev)
+            self.h_bnd = self.h_key
+            self.h_cnt = self.h_key.clone()
+            self.h_b = self.h_g = self.h_y = self.h_key
+            self.mode_val = torch.full((B * G,), -100, dtype=torch.long,
+                                       device=dev)
+            self.mode_cnt = torch.zeros(B * G, dtype=torch.long, device=dev)
+
+        idx2d = (torch.arange(B, device=dev).unsqueeze(1) * G + col_grp)
+        self.copy_mode = self.mode_val[idx2d.reshape(-1)].reshape(B, T)
+        self.copy_mode_p = (self.mode_cnt[idx2d.reshape(-1)].float()
+                            / denom.clamp(min=1.0).reshape(-1)[idx2d.reshape(-1)]
+                            ).reshape(B, T)
+        if fm.any():
+            # a forced row's dense attention is ONE-HOT on the anchor column,
+            # so its snapped copy distribution is a single payload at 1.0 —
+            # expose that through the decode candidates too.
+            self.copy_mode[fm] = self.anchor_pay[fm]
+            self.copy_mode_p[fm] = 1.0
+
+    def _run_slice(self, b, g):
+        """[lo, hi) index range of group (b, g)'s runs in the flat histogram."""
+        base = (b * self.G + g) * self.vocab
+        lo = int(torch.searchsorted(self.h_key,
+                                    torch.tensor(base, device=self.h_key.device),
+                                    side="left"))
+        hi = int(torch.searchsorted(
+            self.h_key,
+            torch.tensor(base + self.vocab - 1, device=self.h_key.device),
+            side="right"))
+        return lo, hi
+
+    def payloads_of(self, b, t):
+        """(values, fractions) of row (b, t)'s own-group payload histogram.
+
+        Forced rows return exactly the anchored payload at 1.0 (one-hot
+        attention semantics)."""
+        if bool(self.forced[b, t] >= 0):
+            dev = self.anchor_pay.device
+            return (torch.tensor([int(self.anchor_pay[b, t])], device=dev),
+                    torch.tensor([1.0], device=dev))
+        lo, hi = self._run_slice(b, int(self.col_grp[b, t]))
+        vals = self.h_y[lo:hi]
+        fr = self.h_cnt[lo:hi].float() / float(self.denom[b, int(self.col_grp[b, t])].clamp(min=1))
+        return vals, fr
+
+    def prob_at(self, targets):
+        """p_copy(target | row) for target token ids (B,T), -100 ignored.
+
+        Snapped semantics: the mass of the row's own token group spreads
+        uniformly over its legal members' PAYLOADS; hist fraction = count /
+        group size. Rows with a forced anchor pin p onto the anchored payload
+        (1 or 0) exactly like the overridden dense attention does.
+        """
+        B, T = self.B, self.T
+        dev = targets.device
+        yq = targets.clamp(min=0)
+        qkey = ((torch.arange(B, device=dev).unsqueeze(1) * self.G
+                 + self.col_grp.to(dev)) * self.vocab + yq).reshape(-1)
+        if self.h_key.numel():
+            lo = torch.searchsorted(self.h_key, qkey, side="left")
+            hi = torch.searchsorted(self.h_key, qkey, side="right")
+            hit = hi > lo
+            cnt = torch.where(hit, self.h_cnt[lo.clamp(max=self.h_key.numel() - 1)],
+                              torch.zeros_like(lo))
+        else:
+            cnt = torch.zeros_like(qkey)
+        denom = self.denom.reshape(-1).clamp(min=1.0)[
+            (torch.arange(B, device=dev).unsqueeze(1) * self.G
+             + self.col_grp).reshape(-1).to(self.denom.device)]
+        p = cnt.reshape(B, T).to(self.denom.device).float() \
+            / denom.reshape(B, T)
+        p = torch.where(targets >= 0, p, torch.zeros_like(p))
+        fpay = (targets.to(self.anchor_pay.device) == self.anchor_pay).float()
+        p = torch.where(self.forced.to(dev) >= 0, fpay.to(dev), p.to(dev))
+        return p
 
 
 class DualHeadDecoder(nn.Module):
@@ -281,6 +534,24 @@ class DualHeadDecoder(nn.Module):
         b = behind.unsqueeze(-1).float()
         gm = gate_mass.unsqueeze(-1)
         return torch.log_softmax(self.gen(torch.cat([h, gm, b], -1)), -1)
+
+    def gate_and_gen(self, h, gate_mass, behind, n_legal=None):
+        """v6 M1-B: stats-path entry — gen log-probs + gate value WITHOUT
+        building any copy tensor or blended logits. Gate logic is identical
+        to forward()'s; the blend itself moved to loss_v33/decode_v33 via
+        exact logaddexp over the target/candidate support."""
+        b = behind.unsqueeze(-1).float()
+        gm = gate_mass.unsqueeze(-1)
+        gen = torch.log_softmax(self.gen(torch.cat([h, gm, b], -1)), -1)
+        if self.gate is not None:
+            top2 = gen.topk(2, dim=-1)
+            margin = (top2[0][..., 0] - top2[0][..., 1]).detach()
+            g = self.gate(h, gate_mass, margin, behind, n_legal)
+        else:
+            g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - 0.5))
+                              .clamp(-6.0, 6.0))
+            g = g * (1.0 - b)                      # prompt/ASI rows: gen
+        return gen, g
 
     def forward(self, h, copy_logits, ctx, attn=None, n_legal=None, behind=None,
                 gate_mass=None, eps=1e-8, sparse=False, nxt=None):
@@ -452,8 +723,13 @@ class HMN3(nn.Module):
                  top_k=2, use_moe=False, use_think=False, k_max=4, tie_weights=True,
                  gate_bias=0.0, aux_copy=True, asi_id=None,
                  sparse_marginal=False, gate_mode="deterministic", user_id=None,
-                 stem_addr=False, seam_addr=False, max_run=16):
+                 stem_addr=False, seam_addr=False, max_run=16,
+                 exact_blend=False):
         super().__init__()
+        # v6 M1-B: False (default) = index/stats path (no (B,T,T)/(B,T,V));
+        # True = legacy dense oracle (bit-faithful pre-M1 behavior) for parity
+        # tests and --exact-blend debugging.
+        self.exact_blend = exact_blend
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
             [HelixCouplingBlock(dim, state_dim) for _ in range(n_layers)]
@@ -496,33 +772,41 @@ class HMN3(nn.Module):
         return _block_fn
 
     def forward(self, input_ids, return_gate=False, return_attn=False,
-                seam_anchor=None):
+                seam_anchor=None, exact_blend=None):
+        ex = self.exact_blend if exact_blend is None else exact_blend
         ids = input_ids
         x = self.embed(ids)                       # raw token lane (IR keys)
         block_fn = self.blocks_apply()
         h = block_fn(x)
         if self.use_think:
             h = self.think(h, block_fn)
-        # v3.3-final: the deterministic gate is read off the register attention,
-        # so always compute it (cheap) and hand it to the dual head.
-        if self.sparse_marginal:
+        if not ex:
+            # ---- v6 M1-B stats path: consumers read the IRStats API; no
+            # dense `a`, no (B,T,V) copy mass, no blended logits tensor.
+            st = self.ir.stats(x, ids, seam_anchor=seam_anchor)
+            gen_logits, g = self.dual.gate_and_gen(h, st.mass_same, st.behind,
+                                                   n_legal=st.n_legal)
+            d = {"gen_logits": gen_logits, "g": g, "stats": st,
+                 "n_legal": st.n_legal}
+        elif self.sparse_marginal:
             a, nxt, n_legal, ctx, behind, gate_mass, _ = \
                 self.ir.sparse_forward(x, ids, h, seam_anchor=seam_anchor)
             logits, g, copy_dist = self.dual(h, None, ctx, attn=a, n_legal=n_legal,
                                              behind=behind, gate_mass=gate_mass,
                                              sparse=True, nxt=nxt)
             attn = a
+            gen_logits = self.dual.gen_probs(h, gate_mass, behind)
+            d = {"logits": logits, "g": g, "copy_dist": copy_dist, "attn": attn,
+                 "n_legal": n_legal, "gen_logits": gen_logits, "nxt": nxt}
         else:
             copy_logits, ctx, attn, n_legal, behind, gate_mass = \
                 self.ir(x, ids, h, return_attn=True, seam_anchor=seam_anchor)
             logits, g = self.dual(h, copy_logits, ctx, attn=attn, n_legal=n_legal,
                                   behind=behind, gate_mass=gate_mass)
             copy_dist = F.normalize(copy_logits.clamp(min=0.0), p=1, dim=-1)
-        gen_logits = self.dual.gen_probs(h, gate_mass, behind)
-        d = {"logits": logits, "g": g, "copy_dist": copy_dist, "attn": attn,
-             "n_legal": n_legal, "gen_logits": gen_logits}
-        if self.sparse_marginal:
-            d["nxt"] = nxt
+            gen_logits = self.dual.gen_probs(h, gate_mass, behind)
+            d = {"logits": logits, "g": g, "copy_dist": copy_dist, "attn": attn,
+                 "n_legal": n_legal, "gen_logits": gen_logits}
         if self.seed_ptr is not None:
             # v5 omega-seam: run-start pointer + run-length heads. Legal seed
             # columns are the prompt region (before the ASI boundary column).
@@ -535,7 +819,7 @@ class HMN3(nn.Module):
             ptr_logits, len_logits = self.seed_ptr(h, x, torch.clamp(bound - 1, min=0))
             d["ptr_logits"] = ptr_logits
             d["len_logits"] = len_logits
-        if return_gate:
+        if return_gate and ex:
             return logits, g
         return d
 

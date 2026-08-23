@@ -18,6 +18,7 @@ Tokenizers: chat specials are encoded PER-PART and joined (never
 encode("<s>..user..<|assistant|>") in one call — the ReTop BPE splits specials
 when concatenated with text, yielding wrong prompt ids).
 """
+import math
 import os
 import random
 
@@ -496,7 +497,8 @@ def seam_losses(out, S, R, A):
     S: bool seam mask; R: run-length class targets (-100 ignore); A: anchor
     columns (-100 ignore) used as the pointer target. Returns (l_ptr, l_len).
     """
-    dev = out["logits"].device
+    dev = (out.get("gen_logits") if "gen_logits" in out
+           else out["logits"]).device
     zero = torch.zeros((), device=dev)
     l_ptr = l_len = zero
     if "ptr_logits" in out and "len_logits" in out and S.any():
@@ -661,10 +663,26 @@ def copy_prob_sparse(attn, nxt, targets):
     return (attn * eq.float()).sum(-1)                          # (B,T)
 
 
+def _logaddexp(a, b):
+    m = max(a, b)
+    return m + math.log(math.exp(min(a, b) - m) + 1.0)
+
+
 def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
     """v3.3 loss = blend CE + w_copy*gen CE (masked) + w_copy*copy CE (manual).
 
-    out must be HMN3.forward's dict: {"logits", "gen_logits", "copy_dist", ...}.
+    out must be HMN3.forward's dict. Two regimes:
+
+    v6 M1-B stats path ("stats" in out — no (B,T,V) blend tensor exists):
+      blend CE : per-target exact logaddexp
+                 -log[(1-g)·p_gen(y) + g·p_copy(y)] on every answer row,
+                 where p_copy comes from the IRStats payload histogram
+                 (st.prob_at). Algebraically the SAME convex blend as the
+                 dense path, evaluated only where it is consumed.
+      gen CE   : identical to below.
+      copy CE  : manual -log p_copy(target) from st.prob_at (Yc rows).
+
+    Dense oracle regime ("logits"/"copy_dist" present, --exact-blend):
 
       blend CE : CE((1-g)*gen + g*copy_dist, Y) on every answer row.
       gen CE   : CE(gen_logits, Y) MASKED to gen rows only (G == 0.0: first
@@ -674,15 +692,51 @@ def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
                  again at the boundary row instead of EOS (pkg060->'OST',
                  pkg066->'6' loop, 2026-08-13). gen_logits is log_softmax, so
                  CE() on it == -log p_gen(target).
-      copy CE  : manual -log p_target on copy_dist. THIS MUST BE -log p, NOT
-                 CrossEntropyLoss(copy_dist, Y): copy_dist is already a
-                 probability distribution (sums to 1), and CE would log-softmax
-                 it a second time, pinning the loss at ~ln(VOCAB)=7.07 with no
-                 gradient (the root cause of every 'frozen' curve since v3.1).
+      copy CE  : manual -log p_target on copy_dist / position gather. THIS MUST
+                 BE -log p, NOT CrossEntropyLoss(copy_dist, Y): copy_dist is
+                 already a probability distribution (sums to 1), and CE would
+                 log-softmax it a second time, pinning the loss at
+                 ~ln(VOCAB)=7.07 with no gradient (the root cause of every
+                 'frozen' curve since v3.1).
     Returns (loss, l_blend, l_gen, l_copy).
     """
     if lossf is None:
         lossf = nn.CrossEntropyLoss(ignore_index=-100)
+    if "stats" in out:
+        # ---------------- v6 M1-B: stats API, zero T^2/T*V tensors ----------
+        st = out["stats"]
+        genlp = out["gen_logits"]                      # (B,T,V) log-probs
+        vocab = genlp.shape[-1]
+        g = out["g"].squeeze(-1)                       # (B,T)
+        ymask = Y != -100
+        lg_y = genlp.gather(2, Y.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        pc = st.prob_at(Yc)                            # (B,T) copy prob of target
+        # blend needs the TRUE zero: a missing payload must make the copy
+        # branch -inf (never a clamped floor that could beat the gen branch
+        # on low-gate rows); the copy CE below keeps the historical 1e-9 cap.
+        lp_c = torch.full_like(pc, float("-inf"))
+        nz = pc > 0
+        lp_c[nz] = pc[nz].log()
+        # NOTE: no artificial clamp on (1-g): the deterministic gate is born
+        # in [0.0025, 0.9975] (sigmoid input pre-clamped to +-6), so log1p(-g)
+        # is finite; the guard below only shields a degenerate learned gate.
+        l_one = torch.logaddexp(torch.log1p(-g.clamp(max=1 - 1e-7)) + lg_y,
+                                torch.log(g.clamp(min=1e-12)) + lp_c)
+        l_blend = -l_one[ymask].mean() if ymask.any() else genlp.new_zeros(())
+        gen_tgt = Y.reshape(-1).clone()
+        gen_tgt[G.reshape(-1) != 0.0] = -100           # gen rows only
+        l_gen = lossf(genlp.reshape(-1, vocab), gen_tgt)
+        cmask = Yc != -100
+        l_copy = -(pc.clamp(min=1e-9).log()[cmask]).mean() \
+            if cmask.any() else genlp.new_zeros(())
+        loss = l_blend + w_copy * l_gen + w_copy * l_copy
+        if w_gate > 0.0:
+            vm = G.reshape(-1) >= 0.0
+            if vm.any():
+                l_gate = nn.functional.binary_cross_entropy(
+                    out["g"].reshape(-1)[vm], (G.reshape(-1)[vm] > 0.5).float())
+                loss = loss + w_gate * l_gate
+        return loss, l_blend, l_gen, l_copy
     vocab = out["logits"].shape[-1]
     l_blend = lossf(out["logits"].reshape(-1, vocab), Y.reshape(-1))
     gen_tgt = Y.reshape(-1).clone()
@@ -801,16 +855,38 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
                 ids.append(nxt)
                 continue
             out = model(inp)
-            logits = out["logits"]
             g = out["g"][0, -1].item()
-            copy = out["copy_dist"][0, -1]
             gates.append(g)
+            if "stats" in out:
+                # v6 M1-B: stats API. Copy candidate = per-group payload MODE
+                # (argmax of the snapped copy distribution); blend argmax is
+                # exact over {gen argmax} ∪ {own-group payloads} because the
+                # snapped copy lane has no support elsewhere.
+                st = out["stats"]
+                gl = out["gen_logits"][0, -1]
+                mv = int(st.copy_mode[0, -1])
+                cand_copy = mv if mv >= 0 else int(gl.argmax())
+                lg1 = math.log(max(1.0 - g, 1e-12))
+                lg2 = math.log(max(g, 1e-12))
+                best_v = int(gl.argmax())
+                best_lp = lg1 + float(gl[best_v])
+                pay, fr = st.payloads_of(0, inp.shape[1] - 1)
+                for v, f in zip(pay.tolist(), fr.tolist()):
+                    lp = _logaddexp(lg1 + float(gl[v]),
+                                    lg2 + math.log(max(float(f), 1e-12)))
+                    if lp > best_lp:
+                        best_v, best_lp = v, lp
+                blend_arg = best_v
+            else:
+                logits = out["logits"]
+                copy = out["copy_dist"][0, -1]
+                cand_copy = int(copy.argmax(-1).item())
+                blend_arg = None
             pair = None
             if len(ids) > len(prompt_ids) + 1:
                 prev = ids[-1]
-                cand = copy.argmax(-1).item()
-                if prev != cand:                      # ignore (x,x) self-pairs:
-                    pair = (prev, cand)               # repeated identical tokens
+                if prev != cand_copy:                 # ignore (x,x) self-pairs:
+                    pair = (prev, cand_copy)          # repeated identical tokens
                                                       # (99999) are legitimately
                                                       # consecutive, not a replay
             if pos_eos and len(ids) - len(prompt_ids) >= ans_len:
@@ -820,12 +896,13 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
             elif boundary_eos and len(ids) > len(prompt_ids) and g < gate_thr:
                 nxt = eos
             elif mode == "copy":
-                nxt = copy.argmax(-1).item()
+                nxt = cand_copy
             elif mode == "hard" and g > gate_thr:
-                nxt = copy.argmax(-1).item()
+                nxt = cand_copy
             else:
                 n_gen += 1
-                nxt = logits[0, -1].argmax(-1).item()
+                nxt = blend_arg if blend_arg is not None \
+                    else int(logits[0, -1].argmax(-1).item())
             if pair is not None:
                 seen_pairs.add(pair)
             if nxt == eos:

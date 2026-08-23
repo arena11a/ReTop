@@ -56,7 +56,9 @@ def build_model(tok, steps, device=None):
         X, Y, _, _ = make_slot_chain_batch(tok, 16, step, stem_row0=True,
                                            device=dev)
         opt.zero_grad()
-        logits = m(X)["logits"]
+        # v6 M1-B: legacy plain blend-CE training runs through the dense
+        # ORACLE to stay bit-identical; decode exercises the stats API.
+        logits = m(X, exact_blend=True)["logits"]
         loss = lossf(logits.reshape(-1, logits.shape[-1]), Y.reshape(-1))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 5.0)

@@ -138,9 +138,11 @@ ambiguity escalation, open-world fallback; 10/10 execution on every family
 Details + open items: [`docs/v5_omega_roadmap.md`](docs/v5_omega_roadmap.md).
 **v6 (active, branch `v6`)**: scale to a community-trainable foundation
 architecture — IR-as-inverted-index, HF packaging, BF16, distributed training.
-M1-A shipped: register gate stats (`mass_same`/`n_legal`) are now derived from
-a token index instead of a second `(B,T,T)` tensor — 153× faster at T=4096,
-all guardrails unchanged. Roadmap:
+M1-A shipped: register gate stats (`mass_same`/`n_legal`) derived from a token
+index instead of a second `(B,T,T)` tensor — 153× faster at T=4096. M1-B
+shipped: the default forward is index-native (`IRStats`) — no `(B,T,T)`/`(B,T,V)`
+register tensors, blend CE via exact logaddexp, decode via payload MODE table;
+3.7× less forward memory @T=2048, all guardrails unchanged. Roadmap:
 [`docs/v6_scaling_roadmap.md`](docs/v6_scaling_roadmap.md).
 
 ---

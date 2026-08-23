@@ -58,7 +58,10 @@ def build_model(tok, steps, device=None):
         X, Y, Yc, G = make_slot_batch(tok, SEEN, 16, step, templates=tpls,
                                       stem_row0=True, device=dev)
         opt.zero_grad()
-        logits = m(X)["logits"]
+        # v6 M1-B: this legacy guardrail trains with plain blend-CE (pre-v3.3
+        # recipe); run it through the dense ORACLE to keep the historical
+        # training math bit-identical — decode below exercises the stats API.
+        logits = m(X, exact_blend=True)["logits"]
         loss = torch.nn.CrossEntropyLoss(ignore_index=-100)(
             logits.reshape(-1, logits.shape[-1]), Y.reshape(-1))
         loss.backward()

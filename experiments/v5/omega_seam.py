@@ -135,13 +135,14 @@ def build_tok():
     return Tokenizer.from_file(TOKENIZER)
 
 
-def build_model(tok, args, seam_addr=None):
+def build_model(tok, args, seam_addr=None, exact_blend=False):
     return HMN3(tok.get_vocab_size(), dim=args.dim, state_dim=8,
                 n_layers=args.layers, use_moe=False, gate_bias=-1.0,
                 asi_id=tok.token_to_id(ASSIST),
                 user_id=tok.token_to_id(USER),
                 stem_addr=(args.task in ("joint", "joint3")),
-                seam_addr=args.seam_addr if seam_addr is None else seam_addr)
+                seam_addr=args.seam_addr if seam_addr is None else seam_addr,
+                exact_blend=exact_blend)
 
 
 def eval_reorder_plain(model, tok, a_slots, b_slots, seed=0, max_new=32,
@@ -238,7 +239,9 @@ def train_joint(model, tok, args, dev):
 def run_m0(tok, args, dev):
     """Seam-OFF control: same data/slots, blend-CE-only, free decode."""
     torch.manual_seed(args.seeds[0])
-    m = build_model(tok, args, seam_addr=False).to(dev)
+    # M0 baseline keeps the legacy dense blended logits for its plain-CE loop
+    # (informational seam-OFF control; behavior preserved bit-for-bit).
+    m = build_model(tok, args, seam_addr=False, exact_blend=True).to(dev)
     print(f"== M0: seam OFF baseline, params={sum(p.numel() for p in m.parameters()):,} ==")
     lossf = nn.CrossEntropyLoss(ignore_index=-100)
     opt = torch.optim.AdamW(m.parameters(), lr=args.lr)

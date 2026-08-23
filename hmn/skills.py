@@ -163,13 +163,19 @@ def verify_plan(model, seq, prompt_len, plan, device):
             t += 1
     with torch.no_grad():
         out = model(x, seam_anchor=anch)
-    cd, g = out["copy_dist"][0], out["g"][0]
+    g = out["g"][0]
+    if "stats" in out:
+        # v6 M1-B: a force-anchored row's snapped copy distribution is a
+        # single payload at 1.0 — the anchored payload itself.
+        cand = out["stats"].anchor_pay[0]
+    else:
+        cand = out["copy_dist"][0].argmax(-1)
     rows = 0
     for tt in range(len(seq)):
         c = anch[0, tt].item()
         if c < 0:
             continue
-        if cd[tt].argmax(-1).item() != seq[tt + 1]:
+        if int(cand[tt]) != seq[tt + 1]:
             return False, f"row {tt}: copy argmax != gold", rows
         if float(g[tt]) <= 0.5:
             return False, f"row {tt}: gate closed on planned row", rows
