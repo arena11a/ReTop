@@ -25,9 +25,37 @@ Consequences (v6-M1 builds on this):
 
 ## 1. Milestones
 
+### M1 implementation spec (locked 2026-08-23, after empirical probe)
+
+Probe result (canonical slot seq, β≈31): dense attention rows carry ~9
+non-zero columns — cross-id ε-mass EXISTS (`e^{β·cos}` for cos≈0.2–0.5 is
+small but non-zero). Therefore bit-parity is impossible by construction;
+**behavioral parity** (all guardrail suites + eval accs) is the gate, and the
+semantic change "cross-id ε-mass dropped; twins-uniform snap" must be stated
+in the release notes.
+
+Phased commits (each keeps CI green):
+- **A. intra-dense wins**: replace the second `(B,T,T)` tensor (`same` bool
+  matrix for `mass_same`) and `n_legal` O(T²) reduction with index-derived
+  computations inside the existing dense flow (sort + searchsorted +
+  prefix-sums). No consumer contract changes.
+- **B. consumer migration**: introduce `IRStats` container (CSR grouped by
+  value-id: legal member positions ascending + cumcounts; per-group payload
+  histograms via flattened (b,gid,payload) sort) replacing raw `a` in:
+  `loss_v33` copy branch (`stats.prob_at(Yc)`), blend CE via exact
+  `logaddexp(log(1-g)+gen_logp[y], log g+copy_logp[y])`, gate inputs,
+  ctx (segment-mean), decode copy-argmax (per-group payload MODE table).
+  `out["logits"]` dense-shape becomes oracle-only (`--exact-blend`);
+  trainers/decode consume the stats API. Tests asserting dense shapes are
+  updated with documented rationale.
+- **C. decode candidate scheme**: blend argmax over {gen top-k ∪ copy mode}
+  proven exact via probability bounds; (B,T,V) survives only in
+  `(B,T,V_gen_head)` which is the model output itself (irreducible, §6 note).
+
 | # | Milestone | Work | Pass criterion |
 |---|---|---|---|
 | M0 | Freeze | branch v6 from main @ ed3ef40 | CI green (v3.3/v4/v5 gates) |
+| M0.5 | **Core slim-down** ✅ 2026-08-23 | v2-era models removed (tag v3.3 preserves), dead `key_proj/keys_proj` dropped, `load_compat` shim in all loaders, extras `[hf]/[scale]`, infer v3-only | suites green on slim core |
 | M1 | **IR as inverted index** | replace `_attn` tensors w/ per-sequence index; keep dense path as oracle flag | bit-parity vs dense on slot/chain/perm suites (loss+decode); memory: no (B,T,T)/(B,T,V) allocations at T=4k |
 | M2 | HF packaging | `HMN3Config`/`HMNForCausalLM` (PreTrainedModel), save/from_pretrained, CausalLMOutput; tokenizer round-trip | `SFTTrainer` trains 100 steps on toy data without custom loop; outputs identical to native path |
 | M3 | Precision ladder | AMP BF16 harness; audit loss_v33 / gate BCE / SeedPointer in fp32-island style (softmax/log in fp32); reversible-backward recompute under bf16 | train parity vs FP32 within tolerance on 600-step run; no NaN over 5 seeds |
