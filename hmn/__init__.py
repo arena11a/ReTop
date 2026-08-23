@@ -24,6 +24,8 @@ from hmn.v3 import (
     HMN3_NoReg,
     IdentityRegister,
     LatentThinkingBuffer,
+    RelativeGate,
+    SeedPointer,
 )
 
 __all__ = [
@@ -39,6 +41,8 @@ __all__ = [
     "HMN3_NoReg",
     "IdentityRegister",
     "LatentThinkingBuffer",
+    "RelativeGate",
+    "SeedPointer",
 ]
 
 __version__ = "0.1.0"

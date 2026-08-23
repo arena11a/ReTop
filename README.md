@@ -110,6 +110,33 @@ T-invariant. Honest wall: this works for *echo* tasks only — a reorder
 transform (`fetch {a} and deploy {b}` → `deploy {b} and fetch {a}`) stays at
 0.00 and the anchor actively harms it (`experiments/v4/m12_reorder_probe.py`).
 
+### v5 — omega-seam (2026-08-22, `experiments/v5/omega_seam.py`) — the reorder wall closed
+
+The M12 honest wall (reorder/transform) is now closed by **seam re-seeding**:
+a `SeedPointer` predicts each fragment run's start column + length at seams,
+and the register echoes the anchor deterministically inside runs. Gold is
+assembled from prompt token variants so every answer row has an exact identity
+twin. Default OFF — `test_hmn.py` + `slot_v33_seed42.py` stay bit-identical.
+
+| Probe | seam OFF (all prior configs) | seam ON (600 steps CPU) |
+|---|---|---|
+| Reorder `fetch {a} and deploy {b}` → `deploy {b} and fetch {a}`, unseen slots | **0.000** | **1.000 / 1.000 / 0.950** (3 seeds, mean 0.983) |
+| M0 control, same data, blend-CE only | 0.000 seen+unseen | — |
+
+Design principle: the register fixes CONTENT within a run; the SeedPointer
+fixes RUN BOUNDARIES. Echo = one run; reorder = many runs.
+**v5-M2 joint**: one model (`--task joint`) holds echo chain **1.000** AND
+reorder **1.000/1.000** unseen simultaneously — two anchor machineries
+(stem-addr + seam) coexist behind default-OFF flags.
+**v5-M3 runs**: curriculum ckpt + structural rotation decode passes 20/20 on
+ALL probes — held-out verbs/families, 3-seg AND 4-seg rotations (beyond max
+trained N), repeated digits (`experiments/v5/m3_generalization.py`).
+**v5-M4 skills**: `hmn/skills.py` — distill-verified run recipes (coverage
+gate + teacher-forced evidence), slot-invariant fingerprint retrieval,
+ambiguity escalation, open-world fallback; 10/10 execution on every family
+(`experiments/v5/m4_skills.py`).
+Details + open items: [`docs/v5_omega_roadmap.md`](docs/v5_omega_roadmap.md).
+
 ---
 
 ## Quickstart — running in ~8 minutes
@@ -253,10 +280,13 @@ Data formats (slot-copy, chat pairs, plain text) are documented in
 hmn/                        core package
   __init__.py               HMN, HMN_Option1, HMN3, HMN3_NoReg
   v2.py                     SelectiveSSM, coupling, MoE, episodic memory
-  v3.py                     IdentityRegister, DualHeadDecoder, HMN3
-  recipe.py                 v3.3 recipe: make_chat_ids, loss_v33, decode_v33,
-                            make_slot_batch, eval_slots, resolve_device
-                            ← single source of truth
+  v3.py                     IdentityRegister, DualHeadDecoder, SeedPointer, HMN3
+  recipe.py                 v3.3 recipe + v5 seam machinery: make_chat_ids,
+                            loss_v33, decode_v33(seam), make_reorder_batch,
+                            make_perm_batch, seam_losses, eval_reorders,
+                            resolve_device   ← single source of truth
+  skills.py                 v5 M4 executable skill library (recipes,
+                            fingerprint retrieval, verify_plan coverage gate)
 retop.py                    one-command tok / train / chat (writes config sidecar)
 train_v3.py                 v3 slot-copy trainer (uses hmn/recipe)
 gen_slots.py                slot-copy dataset generator (deterministic seen/unseen)

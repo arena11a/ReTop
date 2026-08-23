@@ -26,9 +26,12 @@ from hmn import (
     HMN3_NoReg,
     HelixCouplingBlock,
     ReversibleFunction,
+    SeedPointer,
     SparseConditionalCompute,
 )
-from hmn.recipe import decode_v33, loss_v33, make_chat_ids
+from hmn.recipe import (ASSIST, USER, decode_v33, eval_reorders, loss_v33,
+                        make_chat_ids, make_perm_ids, make_reorder_batch,
+                        make_reorder_ids, reorder_anchors, seam_losses)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VOCAB = 3190
@@ -287,6 +290,107 @@ def test_recipe_cycle_break_self_pair():
           f"true replay triggers cycle EOS, got {out_rb!r} (expected '9898')")
 
 
+def test_seam_anchor_none_parity():
+    print("[v5 seam: seam_anchor=None is bit-identical to no-anchor]")
+    torch.manual_seed(0)
+    m = HMN3(VOCAB, dim=64, state_dim=8, n_layers=2, use_moe=False,
+             gate_bias=-1.0, asi_id=5, user_id=1, seam_addr=True)
+    x = rand_ids()
+    with torch.no_grad():
+        o1 = m(x)
+        o2 = m(x, seam_anchor=torch.full_like(x, -100))
+    check(torch.equal(o1["logits"], o2["logits"]), "logits identical")
+    check(torch.equal(o1["copy_dist"], o2["copy_dist"]), "copy_dist identical")
+    check(torch.equal(o1["g"], o2["g"]), "gate identical")
+
+
+def test_reorder_anchors_and_batch():
+    print("[v5 seam: reorder anchors force the exact gold payload]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asid = tok.token_to_id(ASSIST)
+    ids, asi_pos, i_u = make_reorder_ids(tok, "pkg028", "lib055")
+    an, s, r = reorder_anchors(ids, asid, tok)
+    # every anchored answer row's forced payload == the next gold token
+    ok_rows = 0
+    for t in range(asi_pos, len(ids) - 1):
+        if an[t] >= 0:
+            check(ids[an[t] + 1] == ids[t + 1],
+                  f"row {t}: payload(ids[{an[t]}+1]) == gold ids[{t}+1]")
+            ok_rows += 1
+    check(ok_rows == len(ids) - asi_pos - 1 - 1,
+          f"all {ok_rows} non-EOS gold rows are copy-anchored (EOS excluded)")
+    check(sum(s) == 3, f"3 runs -> 3 seam rows (got {sum(s)})")
+    gold = tok.decode(ids[asi_pos + 1:]).strip()
+    check(gold.startswith("deploy lib055") and gold.endswith("pkg028"),
+          f"swapped gold decodes correctly ({gold!r})")
+    # batch tensors + losses + backward
+    X, Y, Yc, G, A, S, Rn = make_reorder_batch(
+        tok, [f"pkg{i:03d}" for i in range(40)], [f"lib{i:03d}" for i in range(40, 80)],
+        4, seed=1)
+    m = HMN3(tok.get_vocab_size(), dim=64, state_dim=8, n_layers=2,
+             gate_bias=-1.0, asi_id=tok.token_to_id(ASSIST),
+             user_id=tok.token_to_id(USER), seam_addr=True)
+    out = m(X, seam_anchor=A)
+    _, lb, lg, lc = loss_v33(out, Y, Yc, G)
+    lp, ll = seam_losses(out, S, Rn, A)
+    (lb + lg + lc + lp + ll).backward()
+    n_grad = sum(1 for p in m.parameters() if p.grad is not None)
+    check(n_grad > 0, f"seam training step reaches {n_grad} param grads")
+
+
+def test_decode_seam_mechanics():
+    print("[v5 seam: decode_v33 seam loop runs and terminates]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    torch.manual_seed(0)
+    m = HMN3(tok.get_vocab_size(), dim=48, state_dim=8, n_layers=2,
+             gate_bias=-1.0, asi_id=tok.token_to_id(ASSIST),
+             user_id=tok.token_to_id(USER), seam_addr=True)
+    ids, asi_pos, _ = make_reorder_ids(tok, "pkg007", "lib039")
+    prompt = ids[:asi_pos + 1]
+    # direct decode call (mechanics); eval_reorders exercised below
+    out_txt, gate_avg, _ = decode_v33(m, tok, prompt, max_new=32,
+                                      mode="hard", seam=True, pos_eos=True)
+    check(isinstance(out_txt, str), f"seam decode returns text ({out_txt!r})")
+    acc, gavg = eval_reorders(m, tok, ["pkg007", "pkg008"],
+                              ["lib039", "lib040"], seed=0)
+    check(0.0 <= acc <= 1.0, f"eval_reorders mechanics OK (acc={acc:.2f})")
+
+
+def test_skills_recipes_and_coverage():
+    print("[v5 M4: skill recipes cover gold exactly (echo off-by-one guard)]")
+    from hmn import skills as S
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asid = tok.token_to_id(ASSIST)
+    # rotate recipe: total planned length == gold tail length, anchors valid
+    ids, asi_pos, _ands = make_perm_ids(tok, ["fetch pkg028", "deploy lib055"])
+    P = S.parse_prompt(ids, asid, tok)
+    plan = S.rotate_recipe(P, 1)
+    gold_len = len(ids) - (asi_pos + 1) - 1        # strip EOS
+    check(sum(L for _, L in plan) == gold_len,
+          f"rotate plan covers gold ({sum(L for _, L in plan)} == {gold_len})")
+    ok_rows = all(0 <= c < asi_pos and c + 1 < len(ids) for c, _L in plan)
+    check(ok_rows, "rotate anchor columns are legal prompt columns")
+    # the historical bug: echo must INCLUDE separators (sum(seg_lens) didn't)
+    Pe = S.parse_prompt(make_chat_ids(tok, "fetch pkg028 and deploy lib055",
+                                      None) if False else
+                        make_chat_ids(tok, "fetch pkg028 and deploy lib055"),
+                        asid, tok)
+    ep = S.echo_recipe(Pe)
+    check(sum(L for _, L in ep) == len(Pe["U"]),
+          f"echo plan includes separators ({sum(L for _, L in ep)} == "
+          f"{len(Pe['U'])})")
+    # library ambiguity: same fp, two families -> escalate on hintless match
+    lib = S.SkillLibrary()
+    lib.add("echo", Pe["fp"], "t1")
+    lib.add("rotate", Pe["fp"], "t2")
+    entry, status = lib.match(Pe["fp"])
+    check(entry is None and status == "ambiguous",
+          f"shared-verb fp escalates (status={status!r})")
+    entry, status = lib.match(Pe["fp"], family="echo")
+    check(status == "hit" and entry["family"] == "echo",
+          "hint resolves the ambiguity")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_v2_forward_backward()
@@ -300,4 +404,8 @@ if __name__ == "__main__":
     test_recipe_chat_ids_no_special_split()
     test_recipe_decode_boundary_rule()
     test_recipe_cycle_break_self_pair()
+    test_seam_anchor_none_parity()
+    test_reorder_anchors_and_batch()
+    test_decode_seam_mechanics()
+    test_skills_recipes_and_coverage()
     print("\nALL TESTS PASSED")

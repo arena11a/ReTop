@@ -209,6 +209,307 @@ def make_slot_chain_batch(tok, bs, seed, stem_row0=False, device=None):
     return Xb, Yb, YcB, Gb
 
 
+# ---------------------------------------------------------------------------
+# v5 omega-seam: reorder task (the M12 wall) with fragment-run anchoring
+# ---------------------------------------------------------------------------
+
+REORDER_AND = "and"
+
+
+def _find_word(tok, ids_list, word):
+    """Index of the first single token decoding exactly to `word` (stripped)."""
+    for j, t in enumerate(ids_list):
+        if tok.decode([t]).strip() == word:
+            return j
+    return -1
+
+
+def make_reorder_ids(tok, a_s, b_s):
+    """Build teacher-forced reorder ids from PROMPT token variants.
+
+    ByteLevel BPE gives mid-prompt words their space-prefixed id (' de') while
+    an independently encoded gold starts 'de' — a different id with identical
+    decoded text. Identity addressing needs EXACT ids, so the swapped answer
+    is assembled FROM the user region tokens:  Gt = U[i_u+1:] + [U[i_u]] + U[:i_u]
+    (decodes to "deploy {b} and fetch {a}" after strip; every row copyable).
+    Returns (ids, asi_pos, i_u).
+    """
+    bos = tok.token_to_id(BOS)
+    uid = tok.token_to_id(USER)
+    asid = tok.token_to_id(ASSIST)
+    eos = tok.token_to_id(EOS)
+    U = list(tok.encode(f"fetch {a_s} and deploy {b_s}").ids)
+    i_u = _find_word(tok, U, REORDER_AND)
+    if i_u <= 0:
+        raise AssertionError("make_reorder_ids: 'and' not found as a single token")
+    Gt = U[i_u + 1:] + [U[i_u]] + U[:i_u]
+    ids = [bos, uid] + U + [asid] + Gt + [eos]
+    return ids, 2 + len(U), i_u
+
+
+def _find_all_word(tok, ids_list, word):
+    return [j for j, t in enumerate(ids_list)
+            if tok.decode([t]).strip() == word]
+
+
+def make_perm_ids(tok, parts, sep=REORDER_AND):
+    """v5 M3: N-segment ROTATION ids (generalization of make_reorder_ids).
+
+    user = "p1 sep p2 ... sep pn"; gold = rotate-left [p2..pn, p1], assembled
+    FROM prompt token variants so every answer row keeps an exact identity
+    twin. Works for arbitrary N >= 2 and arbitrary verb phrases per part.
+    Returns (ids, asi_pos, and_positions).
+    """
+    bos = tok.token_to_id(BOS)
+    uid = tok.token_to_id(USER)
+    asid = tok.token_to_id(ASSIST)
+    eos = tok.token_to_id(EOS)
+    user = f" {sep} ".join(parts)
+    U = list(tok.encode(user).ids)
+    ands = _find_all_word(tok, U, sep)
+    if len(ands) != len(parts) - 1:
+        raise AssertionError(
+            f"make_perm_ids: expected {len(parts) - 1} '{sep}' tokens, got {len(ands)}")
+    if any(ands[i] >= ands[i + 1] for i in range(len(ands) - 1)):
+        raise AssertionError("make_perm_ids: separators not strictly increasing")
+    bounds = [-1] + ands + [len(U)]
+    segs = [U[bounds[k] + 1: bounds[k + 1]] for k in range(len(parts))]
+    if any(len(s) == 0 for s in segs):
+        raise AssertionError("make_perm_ids: empty segment")
+    order = list(range(1, len(parts))) + [0]
+    Gt = []
+    for i, oi in enumerate(order):
+        if i > 0:
+            Gt.append(U[ands[0]])
+        Gt.extend(segs[oi])
+    return [bos, uid] + U + [asid] + Gt + [eos], 2 + len(U), ands
+
+
+def perm_anchors(ids, asid, tok, sep=REORDER_AND):
+    """v5 M3: N-run anchors for ids built by make_perm_ids.
+
+    Anchor formulas (derived once, valid for all N):
+      segment-token row (segment k, offset j): anchor col = bounds[k] + 2 + j
+      separator row:                           anchor col = 1 + ands[0]
+    Seam/run extraction is structural (anchor discontinuity), so run count,
+    lengths and permutation shape need NO task-side hardcoding.
+    Same contract as reorder_anchors: (anchors, seams, runs).
+    """
+    asi_pos = ids.index(asid)
+    U = ids[2:asi_pos]
+    Gt = ids[asi_pos + 1:len(ids) - 1]
+    ands = _find_all_word(tok, U, sep)
+    if not ands:
+        raise AssertionError("perm_anchors: no separator token found")
+    n_parts = len(ands) + 1
+    bounds = [-1] + ands + [len(U)]
+    segs = [U[bounds[k] + 1: bounds[k + 1]] for k in range(n_parts)]
+    order = list(range(1, n_parts)) + [0]
+    exp = []
+    for i, oi in enumerate(order):
+        if i > 0:
+            exp.append(U[ands[0]])
+        exp.extend(segs[oi])
+    if Gt != exp:
+        raise AssertionError("perm_anchors: ids were not built by make_perm_ids")
+    cs = []
+    for i, oi in enumerate(order):
+        if i > 0:
+            cs.append(1 + ands[0])
+        for j in range(len(segs[oi])):
+            cs.append(bounds[oi] + 2 + j)
+    n_g = len(Gt)
+    T = len(ids)
+    anchors = [-100] * T
+    seams = [False] * T
+    runs = [-100] * T
+    seam_rows = [r for r in range(n_g) if r == 0 or cs[r] != cs[r - 1] + 1]
+    for si, r0 in enumerate(seam_rows):
+        r1 = seam_rows[si + 1] if si + 1 < len(seam_rows) else n_g
+        anchors[asi_pos + r0] = cs[r0]
+        seams[asi_pos + r0] = True
+        runs[asi_pos + r0] = max(0, (r1 - r0) - 1)
+    for r in range(n_g):
+        if r not in seam_rows:
+            anchors[asi_pos + r] = cs[r]
+    return anchors, seams, runs
+
+
+def reorder_anchors(ids, asid, tok):
+    """Fragment-run anchors for the reorder task (v5 omega-seam).
+
+    The answer is THREE copy runs over the prompt in swapped order:
+      run 0: "{b}-tail"    <- payload chain echoing through U[i_u+1..]
+      run 1: "and"         <- column i_u-1's payload (the 'and' token itself)
+      run 2: "fetch {a}"   <- payload chain restarting at the USER column
+    Anchor semantics match the register: row t copies ids[c+1] when attention
+    is forced onto column c. Returns (anchors, seams, runs) aligned to full
+    `ids` length:
+      anchors[t] anchor column c (-100 where not forced)
+      seams[t]   True on run-start rows (SeedPointer is supervised there)
+      runs[t]    run-length class target (length-1) on seam rows, else -100
+    Raises AssertionError if the swap does not decompose exactly (tokenizer
+    drift guard — same invariant style as make_chat_ids).
+    """
+    asi_pos = ids.index(asid)
+    U = ids[2:asi_pos]                       # user region tokens
+    Gt = ids[asi_pos + 1:len(ids) - 1]       # gold tokens (strip eos)
+    i_u = _find_word(tok, U, REORDER_AND)
+    if i_u <= 0:
+        raise AssertionError("reorder_anchors: 'and' not found as a single token")
+    if Gt != U[i_u + 1:] + [U[i_u]] + U[:i_u]:
+        raise AssertionError("reorder_anchors: swap does not decompose into "
+                             "contiguous prompt runs (use make_reorder_ids)")
+    n_g = len(Gt)
+    i_g = len(U) - i_u - 1                   # index of 'and' within Gt
+    cs = []
+    for r in range(n_g):
+        if r < i_g:
+            cs.append(2 + i_u + r)           # echo through "deploy {b}"
+        elif r == i_g:
+            cs.append(1 + i_u)               # payload of col before ' and'
+        else:
+            cs.append(1 + (r - i_g - 1))     # restart at USER col, echo "{a}"
+    T = len(ids)
+    anchors = [-100] * T
+    seams = [False] * T
+    runs = [-100] * T
+    seam_rows = [r for r in range(n_g)
+                 if r == 0 or cs[r] != cs[r - 1] + 1]
+    for si, r0 in enumerate(seam_rows):
+        r1 = seam_rows[si + 1] if si + 1 < len(seam_rows) else n_g
+        t_row = asi_pos + r0
+        anchors[t_row] = cs[r0]
+        seams[t_row] = True
+        runs[t_row] = max(0, (r1 - r0) - 1)  # class index = length-1
+    # non-seam answer rows still need their forced echo anchor
+    for r in range(n_g):
+        if r not in seam_rows:
+            anchors[asi_pos + r] = cs[r]
+    return anchors, seams, runs
+
+
+def make_reorder_batch(tok, a_slots, b_slots, bs, seed, device=None):
+    """v5 omega-seam batch -> (X, Y, Yc, G, A, S, R).
+
+    Every gold row is a COPY row (gt=1): each reordered token has an anchored
+    prompt twin by construction. Y/Yc/G follow the make_slot_batch contract;
+    A/S/R come from reorder_anchors. Padding: eos / -100 / False.
+    """
+    rng = random.Random(seed)
+    eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
+    X, Y, YC, G, AN, S, R = [], [], [], [], [], [], []
+    for _ in range(bs):
+        a_s = rng.choice(a_slots)
+        b_s = rng.choice(b_slots)
+        ids, asi_pos, _ = make_reorder_ids(tok, a_s, b_s)
+        anchors, seams, runs = reorder_anchors(ids, asid, tok)
+        targets = ids[1:] + [eos]
+        Tn = len(ids)
+        y, yc, gt = [-100] * Tn, [-100] * Tn, [-1.0] * Tn
+        for t in range(asi_pos, Tn):
+            tgt = targets[t]
+            y[t] = tgt
+            if tgt == eos:
+                yc[t] = -100
+                gt[t] = 0.0
+            else:
+                yc[t] = tgt
+                gt[t] = 1.0
+        X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
+        AN.append(anchors); S.append(seams); R.append(runs)
+    dev = resolve_device(device)
+    T = max(len(x) for x in X)
+    Xb = torch.full((bs, T), eos, dtype=torch.long, device=dev)
+    Yb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    YcB = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Gb = torch.full((bs, T), -1.0, dtype=torch.float, device=dev)
+    Ab = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Sb = torch.zeros((bs, T), dtype=torch.bool, device=dev)
+    Rb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    for j in range(bs):
+        L = len(X[j])
+        Xb[j, :L] = torch.tensor(X[j], device=dev)
+        Yb[j, :L] = torch.tensor(Y[j], device=dev)
+        YcB[j, :L] = torch.tensor(YC[j], device=dev)
+        Gb[j, :L] = torch.tensor(G[j], device=dev)
+        Ab[j, :L] = torch.tensor(AN[j], device=dev)
+        Sb[j, :L] = torch.tensor(S[j], device=dev)
+        Rb[j, :L] = torch.tensor(R[j], device=dev)
+    return Xb, Yb, YcB, Gb, Ab, Sb, Rb
+
+
+def make_perm_batch(tok, parts_fn, bs, seed, device=None):
+    """v5 M3 batch for arbitrary rotations -> (X, Y, Yc, G, A, S, R).
+
+    parts_fn(rng) returns the user's `parts` list (e.g. ["fetch pkg001",
+    "deploy lib042", "stop bin007"]); gold = rotate-left. Same tensor
+    contract as make_reorder_batch.
+    """
+    rng = random.Random(seed)
+    eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
+    X, Y, YC, G, AN, S, R = [], [], [], [], [], [], []
+    for _ in range(bs):
+        ids, asi_pos, _ands = make_perm_ids(tok, parts_fn(rng))
+        anchors, seams, runs = perm_anchors(ids, asid, tok)
+        targets = ids[1:] + [eos]
+        Tn = len(ids)
+        y, yc, gt = [-100] * Tn, [-100] * Tn, [-1.0] * Tn
+        for t in range(asi_pos, Tn):
+            tgt = targets[t]
+            y[t] = tgt
+            if tgt == eos:
+                yc[t] = -100
+                gt[t] = 0.0
+            else:
+                yc[t] = tgt
+                gt[t] = 1.0
+        X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
+        AN.append(anchors); S.append(seams); R.append(runs)
+    dev = resolve_device(device)
+    T = max(len(x) for x in X)
+    Xb = torch.full((bs, T), eos, dtype=torch.long, device=dev)
+    Yb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    YcB = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Gb = torch.full((bs, T), -1.0, dtype=torch.float, device=dev)
+    Ab = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Sb = torch.zeros((bs, T), dtype=torch.bool, device=dev)
+    Rb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    for j in range(bs):
+        L = len(X[j])
+        Xb[j, :L] = torch.tensor(X[j], device=dev)
+        Yb[j, :L] = torch.tensor(Y[j], device=dev)
+        YcB[j, :L] = torch.tensor(YC[j], device=dev)
+        Gb[j, :L] = torch.tensor(G[j], device=dev)
+        Ab[j, :L] = torch.tensor(AN[j], device=dev)
+        Sb[j, :L] = torch.tensor(S[j], device=dev)
+        Rb[j, :L] = torch.tensor(R[j], device=dev)
+    return Xb, Yb, YcB, Gb, Ab, Sb, Rb
+
+
+def seam_losses(out, S, R, A):
+    """v5 omega-seam aux losses: pointer CE + length CE on seam rows.
+
+    out must contain "ptr_logits"/"len_logits" (HMN3 with seam_addr=True).
+    S: bool seam mask; R: run-length class targets (-100 ignore); A: anchor
+    columns (-100 ignore) used as the pointer target. Returns (l_ptr, l_len).
+    """
+    dev = out["logits"].device
+    zero = torch.zeros((), device=dev)
+    l_ptr = l_len = zero
+    if "ptr_logits" in out and "len_logits" in out and S.any():
+        b_i, t_i = S.nonzero(as_tuple=True)
+        p = out["ptr_logits"][b_i, t_i]                    # (Ns, T_cols)
+        pt = A[b_i, t_i].clamp(min=0)                      # (Ns,) target col
+        l_ptr = F.cross_entropy(p.float(), pt)
+        ln = out["len_logits"][b_i, t_i]                   # (Ns, max_run)
+        lt = R[b_i, t_i].clamp(min=0)                      # class = length-1
+        l_len = F.cross_entropy(ln.float(), lt)
+    return l_ptr, l_len
+
+
 def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
                      max_new=40, boundary_eos=False, cycle_break=False,
                      pos_eos=False, device=None):
@@ -232,6 +533,115 @@ def eval_slot_chains(model, tok, a_slots, b_slots, seed=0, mode="blend",
         gates.append(g); ngen += ng
     model.train()
     return ok / tot, (sum(gates) / len(gates) if gates else 0.0), ngen / max(1, tot)
+
+
+def decode_rotate(model, tok, prompt_ids, max_new=48, device=None):
+    """v5 M3b: rotation decoding — SeedPointer seeds RUN 0 only; every later
+    run follows the structural cyclic order of the prompt's segments.
+
+    Lesson repeated from v4 (boundary_eos/M6) and now measured here
+    (omega_cur2 ptr3 plateau 0.64-0.70 @2400 steps): a learned head asked to
+    re-seed EVERY seam stays lexicon/geometry-bound, while the answer lane
+    itself is already exact (teacher-forced copy-argmax == gold 1.000). So:
+    neural proposes the first fragment start; the decoder derives segment
+    boundaries (counting the separator token in the USER region) and walks
+    them cyclically — rotate-left semantics, T-invariant, no gold access.
+
+    Returns (text, gate_avg, n_seeded).
+    """
+    ids = list(prompt_ids)
+    eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
+    asi_pos = ids.index(asid)
+    U = ids[2:asi_pos]
+    ands = _find_all_word(tok, U, REORDER_AND)
+    if not ands:
+        raise AssertionError("decode_rotate: no separator in prompt")
+    n_parts = len(ands) + 1
+    bounds = [-1] + ands + [len(U)]
+    ans_len = max(0, len(prompt_ids) - 3)
+    gates = []
+    seeded = 0
+    plan = None          # list of (anchor_col, run_len) consumed in order
+    plan_i = 0
+    run_left = 0
+    cur = None           # (anchor_base, run_start_t)
+    with torch.no_grad():
+        while len(ids) - len(prompt_ids) < max_new:
+            t_idx = len(ids) - len(prompt_ids)
+            if pos_eos_done(t_idx, ans_len):
+                break
+            inp = torch.tensor([ids], device=device)
+            if run_left > 0:
+                c = cur[0] + (t_idx - cur[1])
+                anch = torch.full((1, inp.shape[1]), -100,
+                                  dtype=torch.long, device=device)
+                anch[0, -1] = c
+                out = model(inp, seam_anchor=anch)
+                nxt = ids[c + 1]
+                run_left -= 1
+            else:
+                out = model(inp)
+                if plan is None:
+                    # FIRST seed: neural proposal -> segment index
+                    c0 = int(out["ptr_logits"][0, -1].argmax(-1).item())
+                    src = c0 + 1                      # payload column
+                    k = next((kk for kk in range(n_parts)
+                              if bounds[kk] + 1 <= src <= bounds[kk + 1]), 0)
+                    plan = []
+                    for si in range(n_parts):
+                        seg = (k + si) % n_parts
+                        # same formulas as perm_anchors (verified): segment
+                        # anchor = bounds[seg]+2, length excludes the left
+                        # separator; separator mini-run anchors at 1+ands[0].
+                        plan.append((bounds[seg] + 2,
+                                     bounds[seg + 1] - bounds[seg] - 1))
+                        if si < n_parts - 1:
+                            plan.append((1 + ands[0], 1))   # separator 'and'
+                    plan_i = 0
+                cur_c, L = plan[plan_i]
+                plan_i += 1
+                nxt = ids[cur_c + 1]
+                cur = (cur_c, t_idx)
+                run_left = L - 1
+                seeded += 1
+            gates.append(float(out["g"][0, -1]))
+            if nxt in (eos, asid):
+                break
+            ids.append(nxt)
+    return tok.decode(ids[len(prompt_ids):]).strip(), (
+        sum(gates) / len(gates) if gates else 0.0), seeded
+
+
+def pos_eos_done(t_idx, ans_len):
+    return ans_len is not None and t_idx >= ans_len
+
+
+def eval_reorders(model, tok, a_slots, b_slots, seed=0, mode="hard",
+                  max_new=48, pos_eos=True, device=None):
+    """v5 omega-seam: exact-match on the REORDER task (the M12 wall).
+
+    gold text is the canonical decoding of the swapped prompt-token sequence
+    (ByteLevel keeps the prompt's space-prefixed variants; .strip() normalizes
+    only the leading boundary). Returns (accuracy, avg_gate)."""
+    model.eval()
+    rng = random.Random(seed)
+    ok = tot = 0
+    gates = []
+    for _ in a_slots:
+        a = rng.choice(a_slots)
+        b = rng.choice(b_slots)
+        ids, asi_pos, _ = make_reorder_ids(tok, a, b)
+        prompt = ids[:asi_pos + 1]
+        gold_text = tok.decode(ids[asi_pos + 1:-1]).strip()
+        out, g, _ng = decode_v33(model, tok, prompt, max_new=max_new,
+                                 mode=mode, seam=True, pos_eos=pos_eos,
+                                 device=device)
+        tot += 1
+        ok += int(out.strip() == gold_text)
+        gates.append(g)
+    model.train()
+    return ok / tot, (sum(gates) / len(gates) if gates else 0.0)
 
 
 def copy_prob_sparse(attn, nxt, targets):
@@ -310,7 +720,8 @@ def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
 
 
 def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
-               boundary_eos=False, device=None, cycle_break=False, pos_eos=False):
+               boundary_eos=False, device=None, cycle_break=False, pos_eos=False,
+               seam=False):
     """Greedy decode. mode:
       blend  -> argmax of (1-g)*gen + g*copy
       hard   -> if g > gate_thr: argmax(copy_dist) else argmax(blend)
@@ -342,18 +753,53 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
       determinism family as boundary_eos/cycle_break. Safe only for echo tasks
       where user == gold (slot + chain); default OFF.
     Returns (text, gate_avg, n_gen).
+
+    seam (v5 omega-seam): fragment-run decoding for reorder/transform tasks.
+    State = (run anchor base column, run start row, tokens left in run).
+    Within a run the anchor echoes +1 per row and the emitted token is the
+    forced payload ids[c+1] (deterministic — no second forward needed). When
+    the run is exhausted the SeedPointer heads on the CURRENT forward pick
+    the next run: c_new = argmax ptr_logits, L_new = argmax len_logits + 1.
+    Termination via pos_eos (a pure permutation keeps |answer| == |user|) or
+    an ASI/EOS payload guard. Requires HMN3(seam_addr=True).
     """
     ids = list(prompt_ids)
     eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
     gates, n_gen = [], 0
     seen_pairs = set()
     # v4 M6: expected answer length = user content tokens, known a priori for
     # echo tasks (user == gold). Weaker than it looks: if a future non-echo
     # task needs it, the model must learn to emit EOS itself (pos_eos OFF).
     ans_len = max(0, len(prompt_ids) - 3) if pos_eos else None
+    run_base = run_start = None
+    run_left = 0
     with torch.no_grad():
         for _ in range(max_new):
+            t_idx = len(ids) - len(prompt_ids)          # answer row (0-based)
             inp = torch.tensor([ids], device=device)
+            if seam:
+                if run_left > 0:
+                    c = run_base + (t_idx - run_start)
+                    anch = torch.full((1, inp.shape[1]), -100,
+                                      dtype=torch.long, device=device)
+                    anch[0, -1] = c
+                    out = model(inp, seam_anchor=anch)
+                    nxt = ids[c + 1]
+                    run_left -= 1
+                else:
+                    out = model(inp)
+                    c_new = int(out["ptr_logits"][0, -1].argmax(-1).item())
+                    l_new = int(out["len_logits"][0, -1].argmax(-1).item()) + 1
+                    nxt = ids[c_new + 1]
+                    run_base, run_start, run_left = c_new, t_idx, l_new - 1
+                gates.append(float(out["g"][0, -1]))
+                if pos_eos and t_idx >= ans_len:
+                    break                               # structurally complete
+                if nxt in (eos, asid):
+                    break
+                ids.append(nxt)
+                continue
             out = model(inp)
             logits = out["logits"]
             g = out["g"][0, -1].item()

@@ -70,7 +70,7 @@ class IdentityRegister(nn.Module):
         self.key_proj = nn.Linear(dim, dim)
         self.keys_proj = nn.Linear(dim, dim) if keys_proj else None
 
-    def _attn(self, keys, ids):
+    def _attn(self, keys, ids, seam_anchor=None):
         """Shared identity-lane attention (v4 refactor). Returns everything the
         dense and sparse paths need WITHOUT building the (B, T, V) copy mass:
           a        (B, T, T) position attention over prompt columns
@@ -80,6 +80,14 @@ class IdentityRegister(nn.Module):
           behind   (B, T) bool rows at/before the ASI boundary (forced gen)
           mass_same (B, T) sum of attention over same-token-id columns (gate)
           mask     (B, T, T) bool legal-column mask (needed by position-gather)
+
+        v5 omega-seam: `seam_anchor` (B, T long, -100 = no force) overrides
+        row t's attention onto exactly column seam_anchor[b, t]. This is the
+        run-echo generalization of stem-addr: within a fragment the anchor
+        advances +1 per answer row (deterministic, supplied by recipe.py);
+        at seams the SeedPointer-predicted start column re-seeds the chain.
+        Forced rows open the gate (mass_same=1.0) and leave `behind`.
+        Default None -> bit-identical to v3.3/v4 behavior.
         """
         B, T, D = keys.shape
         beta = self.beta.abs() + 1.0
@@ -138,6 +146,12 @@ class IdentityRegister(nn.Module):
                 a = a.clone()
                 for b in range(B):
                     ub, ab = u[b].item(), r[b].item()
+                    # v5 omega-seam: explicit seam_anchor rows override the
+                    # echo mapping, so skip stem-addr entirely when an anchor
+                    # tensor is present — otherwise it would fire on REORDER
+                    # sequences too (joint M2) and corrupt their non-echo rows.
+                    if seam_anchor is not None:
+                        break
                     for t in range(ab, T):
                         # gold[i] == user token at col u+i (user text == gold in
                         # the echo task); copy payload of column j is ids[j+1],
@@ -149,15 +163,26 @@ class IdentityRegister(nn.Module):
                         a[b, t, c] = 1.0
                         behind[b, t] = False           # copyable row now
                         mass_same[b, t] = 1.0          # gate opens there
+        if seam_anchor is not None:
+            a = a.clone()
+            for b in range(B):
+                for t in range(T):
+                    c = int(seam_anchor[b, t].item())
+                    if c >= 0:
+                        a[b, t, :] = 0.0
+                        a[b, t, c] = 1.0
+                        behind[b, t] = False
+                        mass_same[b, t] = 1.0
         return a, nxt, n_legal, ctx, behind, mass_same, mask
 
-    def forward(self, keys, ids, query, return_attn=False):
+    def forward(self, keys, ids, query, return_attn=False, seam_anchor=None):
         # keys:  (B, T, dim) RAW token embeddings (identity lane, addressing)
         # ids:   (B, T) raw token ids (payload)
         # query: (B, T, dim) — v3.3: IGNORED for addressing (contextual query
         #        was the v3.1 blocker); kept in signature for API compat.
         B, T, D = keys.shape
-        a, nxt, n_legal, ctx, behind, mass_same, _ = self._attn(keys, ids)
+        a, nxt, n_legal, ctx, behind, mass_same, _ = self._attn(
+            keys, ids, seam_anchor=seam_anchor)
         # PAYLOAD = token at position j+1 (masked-off columns carry 0 weight,
         # so their zeroed payload index never scatters).
         mass = torch.zeros(B, T, self.vocab, device=keys.device)
@@ -167,14 +192,15 @@ class IdentityRegister(nn.Module):
             return mass, ctx, a, n_legal, behind, mass_same
         return mass, ctx, n_legal, behind, mass_same
 
-    def sparse_forward(self, keys, ids, query):
+    def sparse_forward(self, keys, ids, query, seam_anchor=None):
         """v4 sparse copy-marginal: return position attention + payload ONLY —
         no (B, T, V) copy-mass tensor is materialized. Copy probabilities are
         recovered on demand with copy_prob_sparse() (position gather). For long
         contexts this removes the O(T·V) memory that grows linearly with T (V =
         3190 fixed) and is the base for template-general copy (M2+).
         """
-        a, nxt, n_legal, ctx, behind, mass_same, mask = self._attn(keys, ids)
+        a, nxt, n_legal, ctx, behind, mass_same, mask = self._attn(
+            keys, ids, seam_anchor=seam_anchor)
         return a, nxt, n_legal, ctx, behind, mass_same, mask
 
     def set_vocab(self, v):
@@ -316,6 +342,44 @@ class RelativeGate(nn.Module):
         return g
 
 
+class SeedPointer(nn.Module):
+    """v5 omega-seam: fragment-run seeder for the Identity Register.
+
+    The reorder wall (M12a-d) decomposes into (a) fragment-seam gate collapse
+    and (b) no mechanism to START a new copy run mid-answer. This module owns
+    exactly that start: at a SEAM row it predicts
+      - which prompt column the run's payload chain starts from (pointer CE
+        against gold run anchors), and
+      - how many tokens the run lasts (length CE against gold run lengths).
+    Between seams the register runs the proven deterministic positional echo
+    (stem-addr generalized: anchor col c advances +1 per answer row), so the
+    learned module is only consulted at run boundaries — the smallest possible
+    learned surface, everything else stays content-addressable identity.
+
+    ptr_logits = beta * cos(Wq h_t, raw keys), masked to columns before ASI.
+    len_logits = Linear(h_t) over classes 1..max_run (class i <-> length i+1).
+    Default OFF; HMN3(seam_addr=True) instantiates it.
+    """
+
+    def __init__(self, dim, max_run=16, beta=20.0):
+        super().__init__()
+        self.q = nn.Linear(dim, dim)
+        self.len_head = nn.Linear(dim, max_run)
+        self.max_run = max_run
+        self.beta = beta
+
+    def forward(self, h, keys, bound):
+        # h, keys: (B,T,D); bound: (B,) long — first illegal column (ASI col or T)
+        q = F.normalize(self.q(h.float()), dim=-1)
+        k = F.normalize(keys.float(), dim=-1)
+        logits = (q @ k.transpose(-1, -2)) * self.beta          # (B,T,T)
+        cols = torch.arange(logits.shape[-1], device=h.device)
+        legal = cols.unsqueeze(0) < bound.unsqueeze(-1)          # (B,T)
+        logits = logits.masked_fill(~legal.unsqueeze(1), float("-inf"))
+        len_logits = self.len_head(h.float())                    # (B,T,max_run)
+        return logits, len_logits
+
+
 class LatentThinkingBuffer(nn.Module):
     """Adaptive deliberation: re-run the WR block sequence over the last hidden
     state, refining it in latent space without decoding to text tokens. Stops
@@ -362,7 +426,7 @@ class HMN3(nn.Module):
                  top_k=2, use_moe=False, use_think=False, k_max=4, tie_weights=True,
                  gate_bias=0.0, aux_copy=True, asi_id=None, keys_proj=False,
                  sparse_marginal=False, gate_mode="deterministic", user_id=None,
-                 stem_addr=False):
+                 stem_addr=False, seam_addr=False, max_run=16):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
@@ -386,6 +450,10 @@ class HMN3(nn.Module):
         self.think = LatentThinkingBuffer(dim, k_max) if use_think else None
         self.aux_copy = aux_copy
         self.sparse_marginal = sparse_marginal
+        # v5 omega-seam: fragment-run seeding (reorder/transform tasks).
+        # Default OFF -> parameter set identical to v3.3/v4 checkpoints.
+        self.seam_addr = seam_addr
+        self.seed_ptr = SeedPointer(dim, max_run=max_run) if seam_addr else None
 
     def moe_aux_loss(self):
         if not self.use_moe:
@@ -401,7 +469,8 @@ class HMN3(nn.Module):
             return h
         return _block_fn
 
-    def forward(self, input_ids, return_gate=False, return_attn=False):
+    def forward(self, input_ids, return_gate=False, return_attn=False,
+                seam_anchor=None):
         ids = input_ids
         x = self.embed(ids)                       # raw token lane (IR keys)
         block_fn = self.blocks_apply()
@@ -412,14 +481,14 @@ class HMN3(nn.Module):
         # so always compute it (cheap) and hand it to the dual head.
         if self.sparse_marginal:
             a, nxt, n_legal, ctx, behind, gate_mass, _ = \
-                self.ir.sparse_forward(x, ids, h)
+                self.ir.sparse_forward(x, ids, h, seam_anchor=seam_anchor)
             logits, g, copy_dist = self.dual(h, None, ctx, attn=a, n_legal=n_legal,
                                              behind=behind, gate_mass=gate_mass,
                                              sparse=True, nxt=nxt)
             attn = a
         else:
             copy_logits, ctx, attn, n_legal, behind, gate_mass = \
-                self.ir(x, ids, h, return_attn=True)
+                self.ir(x, ids, h, return_attn=True, seam_anchor=seam_anchor)
             logits, g = self.dual(h, copy_logits, ctx, attn=attn, n_legal=n_legal,
                                   behind=behind, gate_mass=gate_mass)
             copy_dist = F.normalize(copy_logits.clamp(min=0.0), p=1, dim=-1)
@@ -428,6 +497,18 @@ class HMN3(nn.Module):
              "n_legal": n_legal, "gen_logits": gen_logits}
         if self.sparse_marginal:
             d["nxt"] = nxt
+        if self.seed_ptr is not None:
+            # v5 omega-seam: run-start pointer + run-length heads. Legal seed
+            # columns are the prompt region (before the ASI boundary column).
+            B, T = ids.shape
+            bound = torch.full((B,), T, dtype=torch.long, device=ids.device)
+            if self.ir.asi_id is not None and (ids == self.ir.asi_id).any():
+                idx = (ids == self.ir.asi_id).float().argmax(-1)
+                have = (ids == self.ir.asi_id).any(-1)
+                bound = torch.where(have, idx, torch.full_like(idx, T)).long()
+            ptr_logits, len_logits = self.seed_ptr(h, x, torch.clamp(bound - 1, min=0))
+            d["ptr_logits"] = ptr_logits
+            d["len_logits"] = len_logits
         if return_gate:
             return logits, g
         return d
