@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  guardrails:
+    name: guardrails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install tokenizers
+          pip install -e .
+
+      - name: Model-level tests
+        run: python test_hmn.py
+
+      - name: M1 sparse-marginal parity
+        run: python experiments/v4/m1_sparse_parity.py
+
+      - name: v3.3 seed-42 guardrail (40/40 exact)
+        run: python experiments/verified/slot_v33_seed42.py
+
+      - name: v4 slot guardrail (stem-addr + pos_eos matrix)
+        run: python experiments/verified/slot_v4.py 60
+
+      - name: v4 chain guardrail (pos_eos, 5 seeds + 3-slot length-gen)
+        run: python experiments/verified/chain_v4.py 60

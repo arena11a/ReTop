@@ -29,7 +29,7 @@ import torch
 
 from tokenizers import Tokenizer
 
-from hmn.recipe import decode_v33, make_chat_ids
+from hmn.recipe import decode_v33, make_chat_ids, resolve_device
 from retop import SPECS, build_model as retop_build_model
 
 DEFAULT_TOK = os.path.join(ROOT, "retop_tokenizer.json")
@@ -210,7 +210,7 @@ def poll_training():
 
 # --- CHAT tab ----------------------------------------------------------------
 
-CHAT = {"ckpt": None, "model": None, "tok": None}
+CHAT = {"ckpt": None, "model": None, "tok": None, "device": None}
 
 
 def load_chat(ckpt_path, tok_path, dim, layers, gate_bias, max_new, mode):
@@ -236,8 +236,10 @@ def load_chat(ckpt_path, tok_path, dim, layers, gate_bias, max_new, mode):
                         if k in ("dim", "layers", "moe", "gate_bias")})
     try:
         model = retop_build_model(cfg.get("arch", "v3"), cfg, tok)
-        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-        model.eval()
+        dev = resolve_device()
+        model.load_state_dict(torch.load(ckpt_path, map_location=dev))
+        model.to(dev).eval()
+        CHAT["device"] = dev
     except Exception as e:
         return f"failed to load: {e}", ""
     CHAT.update(ckpt=ckpt_path, model=model, tok=tok)
@@ -255,7 +257,8 @@ def chat_generate(prompt, max_new, mode):
     try:
         ids = make_chat_ids(CHAT["tok"], prompt.strip())
         text, gate, ngen = decode_v33(CHAT["model"], CHAT["tok"], ids,
-                                      max_new=int(max_new), mode=mode)
+                                      max_new=int(max_new), mode=mode,
+                                      device=CHAT.get("device"))
     except Exception as e:
         return f"error: {e}", ""
     wraps = (f"\n\n> gate avg **{gate:.2f}** | generate tokens **{int(ngen)}** — "
@@ -289,6 +292,20 @@ def verify_guards(ckpt_path):
                      f"{row['acc']:.3f}", "probe"])
     status = ("**ALL GUARDS PASSED** ✅" if r["ok"] else "**GUARDRAIL FAILED** ❌")
     return status, rows
+
+
+def run_v4_guardrail():
+    """v4 matrix (M7): re-runs the consolidated v4 guardrail script. Blocks the
+    UI for ~2-3 min (subprocess, captured output returned as markdown)."""
+    script = os.path.join(ROOT, "experiments", "verified", "v4_guardrail.py")
+    if not os.path.exists(script):
+        return "v4_guardrail.py not found"
+    import subprocess as _sp
+    cp = _sp.run([sys.executable, script], cwd=ROOT, capture_output=True, text=True)
+    tail = (cp.stdout + cp.stderr).strip().splitlines()
+    brief = "\n".join(line for line in tail
+                      if "PASSED" in line or "OK" in line or "FAILED" in line)
+    return f"**returncode {cp.returncode}**\n```\n{brief}\n```"
 
 
 # --- layout ------------------------------------------------------------------
@@ -369,6 +386,11 @@ def build():
             ver_md = gr.Markdown("")
             ver_tbl = gr.Dataframe(headers=["check", "acc", "status"],
                                    datatype=["str", "str", "str"], interactive=False)
+            gr.Markdown("**v4 matrix** — one command re-runs every v4 gate "
+                        "(test_hmn, M1 parity, seed-42 40/40, M8 smoke). "
+                        "Takes ~2-3 min CPU.")
+            v4_btn = gr.Button("🚦 Run full v4 guardrail", variant="secondary")
+            v4_md = gr.Markdown("")
         # --- event wiring ---
         gen_btn.click(generate_data, [template, kind, n_seen, n_unseen, seed, out_path],
                       [gen_md, gen_log, data_path_in], queue=True)
@@ -384,6 +406,7 @@ def build():
                        [load_md, load_md], queue=True)
         chat_btn.click(chat_generate, [prompt, max_new, mode_c], [answer, answer], queue=True)
         ver_btn.click(verify_guards, ckpt_v, [ver_md, ver_tbl], queue=True)
+        v4_btn.click(run_v4_guardrail, None, v4_md, queue=True)
     return demo
 
 

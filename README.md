@@ -5,8 +5,10 @@
 two lanes separate — one that *thinks* and one that *copies verbatim*.
 
 Its headline result: re-emitting the **exact literal of an UNSEEN token** from
-the prompt, at **40/40** on the canonical slot-copy eval — something a
-single-pass softmax decoder structurally cannot do — trained in ~7 minutes on a
+the prompt, at **40/40** on the canonical slot-copy eval — a capability a
+same-size single-pass softmax decoder does NOT reproduce on unseen inputs
+(measured 0/40 in `experiments/v4/m8_baseline.py`; it rote-fits the pairs it
+saw) — trained in ~7 minutes on a
 4-core CPU with ~4 GB RAM.
 
 ```
@@ -77,6 +79,64 @@ Generalization — measured, honest boundaries (§5 of `docs/hmn_v3_design.md`):
 | Templates `import / run / apt install` | 0/40 | gate is lexicon-bound to the trained template — NOT a general "copy prompt tail" op |
 | Repeated-digit slots (`pkg333..pkg999`) | 3/9 | copy lane loops (gate stays ≥0.93), boundary rule can't fire |
 
+### v4 — M2-dev/M6 (2026-08-13, `docs/v4_roadmap.md`) — the two rows above closed
+
+The two honest-boundary rows were *not* fundamental: **stem-addressing** makes
+row-0 addressable (flag `<--stem-addr>` on `train_v3.py`), and **pos_eos**
+(bound answer length at decode) closes termination. Everything above is
+guardrail-verified, default-OFF so `v3.3` repro is bit-identical
+(`test_hmn.py`, M1 parity, seed-42 40/40 all pass).
+
+| Milestone | Config | Result |
+|---|---|---|
+| M2-dev slot, 10 templates + 4 never-seen probes | `--stem-addr`, 600 steps, unseen slots | trained 1.00, probes `mount/uninstall/clean/check` **1.00** (were 0.00 in every prior config) |
+| M2-dev→M4 chain, no-think | `--stem-addr`, 600 steps | unseen blend/hard **1.00**, robust across 5 seeds |
+| M6 repeated-digit slots (`pkg333..`) | + `pos_eos` (decode) | **1.00** hard+blend (was 0.333) |
+| M6 chain long-EOS loop | + `pos_eos` | hard 0.948 → **1.00** |
+| M8 baseline (same size/task) | HMN3 664K vs vanilla 667K vs NoReg 342K | HMN3 1.00/1.00; vanilla + NoReg **0.00** on unseen (vanilla rote-fits seen: `pkg099→pkg049`) |
+| v3.3 matrix closed (M2-dev+M6) | same stem-addr ckpt + pos_eos | 4-digit 0.925→**1.00**, 5-digit 0.925→**1.00**, alnum→**1.00**, repeated 0.333→**1.00** |
+| M6 chain length generalization | same 2-slot ckpt, zero retrain | 3/4-slot chains, unseen verb `open`: **1.00** hard+blend (length-generalizing, not just template) |
+| M6 chain fully closed | `pos_eos` on think + no-think | 0.948/0.950 → **1.00** both variants; avg gate 0.948 unchanged (content was always right, termination was the fix) |
+| M2-dev slot, blend deployment path | `pos_eos` | trained 10/10 + 4 probes + 4-row matrix (repeated/alnum/double-pad) **1.00** hard+blend |
+| M12 reorder probe (honest wall) | trained swap task 240 steps x2 | unseen **0.00** both configs; anchor actively harms (16.3 vs 4.2 loss) — echo-only by design |
+
+Design principle that fell out of M6: **the copy pointer fixes CONTENT; a
+length-bound fixes TERMINATION.** The latent 'think' buffer meanwhile added ~0
+once the anchor existed (chain 0.948 both variants, and `pos_eos` lifts both to
+1.00) — compute scaling bought less than fixing the address. The decoder-side
+fix is length-generalizing: the same 2-slot checkpoint answers 3- and 4-slot
+chains with unseen verbs at 1.00, because the anchor `c = u + (t-a)` is
+T-invariant. Honest wall: this works for *echo* tasks only — a reorder
+transform (`fetch {a} and deploy {b}` → `deploy {b} and fetch {a}`) stays at
+0.00 and the anchor actively harms it (`experiments/v4/m12_reorder_probe.py`).
+
+### v5 — omega-seam (2026-08-22, `experiments/v5/omega_seam.py`) — the reorder wall closed
+
+The M12 honest wall (reorder/transform) is now closed by **seam re-seeding**:
+a `SeedPointer` predicts each fragment run's start column + length at seams,
+and the register echoes the anchor deterministically inside runs. Gold is
+assembled from prompt token variants so every answer row has an exact identity
+twin. Default OFF — `test_hmn.py` + `slot_v33_seed42.py` stay bit-identical.
+
+| Probe | seam OFF (all prior configs) | seam ON (600 steps CPU) |
+|---|---|---|
+| Reorder `fetch {a} and deploy {b}` → `deploy {b} and fetch {a}`, unseen slots | **0.000** | **1.000 / 1.000 / 0.950** (3 seeds, mean 0.983) |
+| M0 control, same data, blend-CE only | 0.000 seen+unseen | — |
+
+Design principle: the register fixes CONTENT within a run; the SeedPointer
+fixes RUN BOUNDARIES. Echo = one run; reorder = many runs.
+**v5-M2 joint**: one model (`--task joint`) holds echo chain **1.000** AND
+reorder **1.000/1.000** unseen simultaneously — two anchor machineries
+(stem-addr + seam) coexist behind default-OFF flags.
+**v5-M3 runs**: curriculum ckpt + structural rotation decode passes 20/20 on
+ALL probes — held-out verbs/families, 3-seg AND 4-seg rotations (beyond max
+trained N), repeated digits (`experiments/v5/m3_generalization.py`).
+**v5-M4 skills**: `hmn/skills.py` — distill-verified run recipes (coverage
+gate + teacher-forced evidence), slot-invariant fingerprint retrieval,
+ambiguity escalation, open-world fallback; 10/10 execution on every family
+(`experiments/v5/m4_skills.py`).
+Details + open items: [`docs/v5_omega_roadmap.md`](docs/v5_omega_roadmap.md).
+
 ---
 
 ## Quickstart — running in ~8 minutes
@@ -94,6 +154,26 @@ pip install -e .            # installs the retop / retop-infer / retop-gui comma
 > The `-e .` install is **required**: `train_v3.py`, `gen_slots.py` etc. run from
 > the repo root, but the `retop*` console commands (incl. the GUI) only exist
 > after it. It pulls the `hmn` package into your environment — no GPU needed.
+
+### Compute devices (auto-detect — no flags needed)
+
+Every entry point (`train_v3.py`, the guardrails, `infer.py`, `retop.py chat`,
+the GUI) resolves the device once via `hmn.recipe.resolve_device` and threads it
+through batches, evals and decode. Resolution order:
+
+1. an explicit `--device` flag (e.g. `--device cuda:0`),
+2. the `RETOP_DEVICE` env var (e.g. `RETOP_DEVICE=mps`),
+3. auto-detect: `cuda` → `mps` → `cpu` (first one available).
+
+A CPU-only machine is untouched (falls back to `cpu`); a machine with a CUDA or
+Apple-silicon GPU actually uses it — no configuration required. Everything is
+verified CPU-safe: the full `experiments/verified/v4_guardrail.py --device cpu`
+passes, and `test_hmn.py` runs on CPU by design.
+
+```bash
+python train_v3.py --steps 600 --device cuda        # use a real GPU
+RETOP_DEVICE=cpu python train_v3.py --steps 600     # force CPU anywhere
+```
 
 ### 1. Verify the shipped checkpoint (guardrail, ~25 s CPU)
 
@@ -200,9 +280,13 @@ Data formats (slot-copy, chat pairs, plain text) are documented in
 hmn/                        core package
   __init__.py               HMN, HMN_Option1, HMN3, HMN3_NoReg
   v2.py                     SelectiveSSM, coupling, MoE, episodic memory
-  v3.py                     IdentityRegister, DualHeadDecoder, HMN3
-  recipe.py                 v3.3 recipe: make_chat_ids, loss_v33, decode_v33,
-                            make_slot_batch, eval_slots  ← single source of truth
+  v3.py                     IdentityRegister, DualHeadDecoder, SeedPointer, HMN3
+  recipe.py                 v3.3 recipe + v5 seam machinery: make_chat_ids,
+                            loss_v33, decode_v33(seam), make_reorder_batch,
+                            make_perm_batch, seam_losses, eval_reorders,
+                            resolve_device   ← single source of truth
+  skills.py                 v5 M4 executable skill library (recipes,
+                            fingerprint retrieval, verify_plan coverage gate)
 retop.py                    one-command tok / train / chat (writes config sidecar)
 train_v3.py                 v3 slot-copy trainer (uses hmn/recipe)
 gen_slots.py                slot-copy dataset generator (deterministic seen/unseen)
@@ -212,6 +296,7 @@ retop_gui.py                4-tab Gradio UI (DATA/TRAIN/CHAT/VERIFY)
 test_hmn.py                 model tests incl. recipe guardrails
 hmn_v33.pt[.json]           verified checkpoint + recipe sidecar
 experiments/verified/slot_v33_seed42.py   one-command 40/40 guardrail
+experiments/verified/v4_guardrail.py      full v4 gate: tests + M1 + M8 + slots + chains
 docs/                       design + data-prep (hmn_v3_design.md, data_prep.md)
 data/                       training corpora (git-ignored, from gen_*.py)
 retop_tokenizer.json        the tokenizer (vocab 3190)
@@ -240,14 +325,21 @@ retop_tokenizer.json        the tokenizer (vocab 3190)
 - `HMN3` builds a `(B, T, vocab)` attention-mass tensor per forward — fine for
   the toy sequence lengths, don't scale to long contexts without reworking the
   copy-marginal.
-- Copy-gate generalizes over slot *values* but not over *templates* (§2 of the
-  design doc) — the Identity Register is not yet a general copy operation.
-- Repeated-identical tokens inside a slot let the copy lane loop (gate stays
-  high); the boundary rule cannot fire. See `docs/hmn_v3_design.md` §5.
+- v3.3's known generalization gaps — seen-verb-only templates, repeated-digit
+  slot loops, 4/5-digit leaks — are all closed in v4 under two decode-side
+  flags (stem-addressing + pos_eos; see the v4 table above). The remaining
+  open item is architectural, not a flag: reorder/transform tasks (answer =
+  swapped echo, e.g. `deploy lib055 and fetch pkg028`). Four independent
+  probes (long-horizon training, a `swap:` marker, a gate-level decomposition,
+  and a miniature pointer-net) all converge on the same diagnosis: the copy
+  lane re-emits reordered contiguous text fine once started, but the gate
+  collapses to gen at the fragment seam, and gen has no content mechanism —
+  so the model memorizes training digits instead. Closing it needs SEAM
+  RE-SEEDING (carry a fragment-start column through the seam so the pointer
+  re-points content-addressably), an architectural change, not a flag.
+  Honest boundary; default OFF.
 
----
-
-## Reproducibility
+### Reproducibility
 
 Every generator and trainer takes a `--seed`; slot data, splits, and decodes are
 deterministic (greedy). The seed-42 eval guardrail
