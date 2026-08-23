@@ -1,8 +1,10 @@
 # ReTop v4 — longer, smarter, template-general (roadmap)
 
-> Status: **in development** (branch `v4`). v3.3 (`hmn_v33.pt`) is the frozen,
-> guardrail-verified baseline; all v4 work is additive behind an `arch=v4`
-> opt-in so v3.3 behavior never changes.
+> Status: **COMPLETED & ARCHIVED (2026-08-23).** All shipped milestones are in
+> the README tables; M5's open tail (silver/gold GPU specs tuned on real CUDA)
+> and the M12 reorder wall carry into `docs/v5_omega_roadmap.md` (M12 closed
+> there as M1). This document is historical — do not extend it; new work goes
+> to a fresh roadmap per major version.
 
 ---
 
