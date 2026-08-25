@@ -668,6 +668,41 @@ def _logaddexp(a, b):
     return m + math.log(math.exp(min(a, b) - m) + 1.0)
 
 
+def blend_argmax(gen_logp, g, pay_vals, pay_fracs):
+    """v6 M1-C: EXACT blended-distribution argmax from candidate sets only.
+
+    The snapped copy lane has support ONLY on the seed group's payloads P
+    (fractions fr>0); everywhere else p(v) = (1-g)*p_gen(v). Bound: let
+    w = argmax_v p_gen(v). For any u outside P,
+        p(u) <= (1-g)*p_gen(u) <= (1-g)*p_gen(w) <= p(w),
+    so the global argmax always lies in {w} ∪ P — no gen top-k needed.
+    Ties go to the gen side (strict >), matching torch.argmax convention of
+    preferring the earlier candidate deterministically.
+
+    gen_logp : (V,) log-probs of the gen head at the row
+    g        : float gate value in [0, 1]
+    pay_vals : LongTensor payload ids in P
+    pay_fracs: FloatTensor copy fractions aligned with pay_vals
+    Returns next-token id (int).
+    """
+    lg1 = math.log(max(1.0 - g, 1e-12))
+    lg2 = math.log(max(g, 1e-12))
+    w = int(gen_logp.argmax())
+    payset = set(pay_vals.tolist()) if hasattr(pay_vals, "tolist") else set(pay_vals)
+    # the non-support champion is the gen argmax ONLY when it lies outside P;
+    # inside P it is scored exactly by the loop below (adding its copy mass)
+    best_v, best_lp = (None, float("-inf"))
+    if w not in payset:
+        best_v, best_lp = w, lg1 + float(gen_logp[w])
+    for v, f in zip(pay_vals.tolist(), pay_fracs.tolist()):
+        lp = _logaddexp(lg1 + float(gen_logp[v]), lg2 + math.log(max(float(f), 1e-12)))
+        if lp > best_lp:
+            best_v, best_lp = v, lp
+    if best_v is None:
+        best_v = w
+    return best_v
+
+
 def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
     """v3.3 loss = blend CE + w_copy*gen CE (masked) + w_copy*copy CE (manual).
 
@@ -858,25 +893,16 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
             g = out["g"][0, -1].item()
             gates.append(g)
             if "stats" in out:
-                # v6 M1-B: stats API. Copy candidate = per-group payload MODE
-                # (argmax of the snapped copy distribution); blend argmax is
-                # exact over {gen argmax} ∪ {own-group payloads} because the
-                # snapped copy lane has no support elsewhere.
+                # v6 M1-C: copy candidate = per-group payload MODE (argmax of
+                # the snapped copy distribution); the blend argmax is EXACT
+                # over {gen argmax} ∪ {own-group payloads} — proven bound, no
+                # gen top-k needed (see blend_argmax).
                 st = out["stats"]
                 gl = out["gen_logits"][0, -1]
                 mv = int(st.copy_mode[0, -1])
                 cand_copy = mv if mv >= 0 else int(gl.argmax())
-                lg1 = math.log(max(1.0 - g, 1e-12))
-                lg2 = math.log(max(g, 1e-12))
-                best_v = int(gl.argmax())
-                best_lp = lg1 + float(gl[best_v])
                 pay, fr = st.payloads_of(0, inp.shape[1] - 1)
-                for v, f in zip(pay.tolist(), fr.tolist()):
-                    lp = _logaddexp(lg1 + float(gl[v]),
-                                    lg2 + math.log(max(float(f), 1e-12)))
-                    if lp > best_lp:
-                        best_v, best_lp = v, lp
-                blend_arg = best_v
+                blend_arg = blend_argmax(gl, g, pay, fr)
             else:
                 logits = out["logits"]
                 copy = out["copy_dist"][0, -1]

@@ -75,15 +75,23 @@ Phased commits (each keeps CI green):
   decode (slot_v4/chain_v4 1.000, v5 M3 20/20, M4 all PASS). Legacy plain-CE
   guardrail trainers (slot_v4/chain_v4) keep their historical math via the
   oracle at train time and exercise the stats path at decode.
-- **C. decode candidate scheme**: blend argmax over {gen top-k ∪ copy mode}
-  proven exact via probability bounds; (B,T,V) survives only in
-  `(B,T,V_gen_head)` which is the model output itself (irreducible, §6 note).
+- **C. decode candidate scheme** ✅ 2026-08-23: blend argmax needs NO gen
+  top-k. Bound (proved): the snapped copy lane has support only on the seed
+  group's payloads P; for any u ∉ P, p(u) = (1−g)p_gen(u) ≤ (1−g)p_gen(w) ≤
+  p(w) where w = gen argmax — so the global argmax always lies in {w} ∪ P,
+  and w itself is scored exactly when it lies inside P (`blend_argmax`,
+  `hmn/recipe.py`; 300/300 randomized trials match full-vocab brute force).
+  `(B,T,V)` survives only as `(B,T,V_gen_head)` — the model output itself.
+  **M1 COMPLETE**: stats path allocates no T²/T·V register tensors
+  (T=2048 forward peak-RSS 1299 MB oracle vs 349 MB index); dense path kept
+  as bit-faithful oracle (`exact_blend=True`); behavioral parity held across
+  every suite (see A/B entries).
 
 | # | Milestone | Work | Pass criterion |
 |---|---|---|---|
 | M0 | Freeze | branch v6 from main @ ed3ef40 | CI green (v3.3/v4/v5 gates) |
 | M0.5 | **Core slim-down** ✅ 2026-08-23 | v2-era models removed (tag v3.3 preserves), dead `key_proj/keys_proj` dropped, `load_compat` shim in all loaders, extras `[hf]/[scale]`, infer v3-only | suites green on slim core |
-| M1 | **IR as inverted index** | replace `_attn` tensors w/ per-sequence index; keep dense path as oracle flag | bit-parity vs dense on slot/chain/perm suites (loss+decode); memory: no (B,T,T)/(B,T,V) allocations at T=4k |
+| M1 | **IR as inverted index** ✅ 2026-08-23 (A+B+C) | replace `_attn` tensors w/ per-sequence index; keep dense path as oracle flag | behavioral parity on slot/chain/perm suites (loss+decode) — MET; memory: no (B,T,T)/(B,T,V) allocations at T=4k — MET by the stats path |
 | M2 | HF packaging | `HMN3Config`/`HMNForCausalLM` (PreTrainedModel), save/from_pretrained, CausalLMOutput; tokenizer round-trip | `SFTTrainer` trains 100 steps on toy data without custom loop; outputs identical to native path |
 | M3 | Precision ladder | AMP BF16 harness; audit loss_v33 / gate BCE / SeedPointer in fp32-island style (softmax/log in fp32); reversible-backward recompute under bf16 | train parity vs FP32 within tolerance on 600-step run; no NaN over 5 seeds |
 | M4 | Scale spec + smoke | new specs (`gpu-large`: D768/L12 MoE-SwiGLU top-k2 …); single-GPU A100 smoke train | loss ↓ monotonically 1k steps at D768; tokens/s reported; ckpt resumable |

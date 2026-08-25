@@ -407,6 +407,35 @@ def test_v6_m1b_stats_vs_oracle():
     check(float(p[0, 9]) > 0.4, f"copy target probability sharp ({float(p[0, 9]):.3f})")
 
 
+def test_v6_m1c_blend_argmax_bound():
+    print("[v6 M1-C: {gen-argmax} ∪ payload scheme == full-vocab brute force]")
+    from hmn.recipe import blend_argmax
+    torch.manual_seed(11)
+    V = 500
+    bad = 0
+    for trial in range(300):
+        gen = torch.log_softmax(torch.randn(V), -1)
+        g = float(torch.randint(0, 4, (1,)).float() / 3)   # 0, 1/3, 2/3, 1
+        npay = int(torch.randint(0, 9, (1,)))
+        if npay:
+            pay = torch.randperm(V)[:npay]
+            raw = torch.rand(npay) + 0.01
+            fr = raw / raw.sum()
+        else:
+            pay = torch.zeros(0, dtype=torch.long)
+            fr = torch.zeros(0)
+        got = blend_argmax(gen, g, pay, fr)
+        p = (1 - g) * gen.exp()
+        if npay:
+            p.index_add_(0, pay, g * fr)
+        want = int(p.argmax())
+        # optimality within FP noise: id flips are only allowed between
+        # numerically-equal candidates (knife-edge ties from exp/log rounding)
+        if float(p[got]) < float(p[want]) - 1e-9:
+            bad += 1
+    check(bad == 0, f"300 randomized trials match brute force ({bad} misses)")
+
+
 def test_reorder_anchors_and_batch():
     print("[v5 seam: reorder anchors force the exact gold payload]")
     tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
@@ -508,6 +537,7 @@ if __name__ == "__main__":
     test_seam_anchor_none_parity()
     test_v6_m1a_index_stats()
     test_v6_m1b_stats_vs_oracle()
+    test_v6_m1c_blend_argmax_bound()
     test_reorder_anchors_and_batch()
     test_decode_seam_mechanics()
     test_skills_recipes_and_coverage()
