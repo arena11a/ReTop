@@ -152,7 +152,9 @@ computed on-the-fly per document, so no precomputed label storage is needed.
 Fused dual-head kernel = gen log-softmax + copy distribution + gate blend in
 one pass (removes three (B,T,V) round-trips). Only started after M1 freezes
 semantics — kernels chase a moving target otherwise. torch.compile probe runs
-in M4 to catch free wins early.
+in M4 to catch free wins early. Design notes + CPU torch.compile probe:
+`docs/v6_m7_triton_design.md`, `experiments/v6/m7_compile_probe.py`
+(2026-08-26; kernels themselves pending GPU hardware).
 
 ## 3. Non-goals for v6
 
