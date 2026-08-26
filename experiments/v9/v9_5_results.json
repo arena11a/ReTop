@@ -1,0 +1,29 @@
+{
+  "baseline": {
+    "verb_accs": {
+      "start/stop": 0.0,
+      "push/pull": 0.0,
+      "read/write": 0.0,
+      "open/close": 0.0
+    },
+    "avg_verb": 0.0
+  },
+  "multitask_50": {
+    "verb_accs": {
+      "start/stop": 0.0,
+      "push/pull": 0.0,
+      "read/write": 0.0,
+      "open/close": 0.0
+    },
+    "avg_verb": 0.0
+  },
+  "curriculum": {
+    "verb_accs": {
+      "start/stop": 0.0,
+      "push/pull": 0.0,
+      "read/write": 0.0,
+      "open/close": 0.0
+    },
+    "avg_verb": 0.0
+  }
+}
