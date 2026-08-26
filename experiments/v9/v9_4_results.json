@@ -1,0 +1,20 @@
+{
+  "normalized": {
+    "verb_accs": {
+      "start/stop": 0.0,
+      "push/pull": 0.0,
+      "read/write": 0.1,
+      "open/close": 0.2
+    },
+    "avg_verb": 0.07500000000000001
+  },
+  "baseline": {
+    "verb_accs": {
+      "start/stop": 0.0,
+      "push/pull": 0.0,
+      "read/write": 0.0,
+      "open/close": 0.0
+    },
+    "avg_verb": 0.0
+  }
+}
