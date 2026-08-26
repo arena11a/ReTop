@@ -1,6 +1,6 @@
 # ReTop v7 — Attention-WR variant + evaluation harness + MoE scaling
 
-> Status: **in-progress (2026-08-26).** M8-M11 ✅ shipped. M12-M14 pending.
+> Status: **complete (2026-08-26).** M8-M14 all shipped.
 > D≥512, build an evaluation harness, and scale MoE routing. v6 delivered
 > the community-trainable foundation; v7 decides which WR variant wins at
 > scale and provides the eval infrastructure to prove it.
@@ -24,9 +24,9 @@ on the same benchmarks and produces comparable metrics.
 | M9 | **MoE routing improvements** ✅ | Expert load-balancing loss (Switch Transformer style); top-k routing with noisy gates; expert capacity factor tuning. Measure utilization across 16/32/64 experts. | aux load-balancing loss < 0.1; expert utilization variance < 2× mean; slot-copy parity maintained |
 | M10 | **Long-context scaling** ✅ | Test at T=8k/16k with packed sequences; sparse attention patterns for IR (only attend to distinct tokens, not all positions); measure memory vs T. | T=8k forward fits in 8GB; T=16k forward fits in 16GB; slot-copy accuracy unchanged at T=8k |
 | M11 | **Evaluation harness** ✅ | Automated eval suite: slot-copy (seen/unseen), chain, reorder, permutation; metrics: exact-match accuracy, gate statistics, copy-vs-gen ratio; comparison tool for two checkpoints. | harness runs all evals in one command; produces JSON report; comparison tool shows diff between two checkpoints |
-| M12 | **Distillation / quantization** | Teacher-student distillation (large → small); INT8 dynamic quantization for inference; measure accuracy retention. | distilled model retains ≥90% teacher accuracy; INT8 quantization retains ≥95% accuracy; inference speedup ≥1.5× |
-| M13 | **Multi-task training** | Joint training on copy + reorder + permutation tasks; task-specific prompts; measure negative transfer. | joint model matches per-task baselines within 5%; no task drops >10% |
-| M14 | **Production deployment** | ONNX export; serving benchmark (latency, throughput); Docker container; API spec. | ONNX model loads and runs; latency < 50ms per token at D=256; Docker image < 1GB |
+| M12 | **Distillation / quantization** ✅ | Teacher-student distillation (large → small); INT8 dynamic quantization for inference; measure accuracy retention. | distilled model retains ≥90% teacher accuracy; INT8 quantization retains ≥95% accuracy; inference speedup ≥1.5× |
+| M13 | **Multi-task training** ✅ | Joint training on copy + reorder + permutation tasks; task-specific prompts; measure negative transfer. | joint model matches per-task baselines within 5%; no task drops >10% |
+| M14 | **Production deployment** ✅ | ONNX export; serving benchmark (latency, throughput); Docker container; API spec. | ONNX model loads and runs; latency < 50ms per token at D=256; Docker image < 1GB |
 
 ## 2. Architecture notes
 
