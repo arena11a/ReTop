@@ -1,318 +1,319 @@
-# v6 M7 — Kernels: fused dual-head design notes + torch.compile probe
+# v6 M7 — Kernel design notes: fused dual-head + optional SSM scan, torch.compile probe
 
-> Status: **design + probe (2026-08-26, branch v6).** Roadmap item M7
-> (`docs/v6_scaling_roadmap.md` §1 table): *"Triton fused dual-head (gen
-> softmax ⊕ copy ⊕ gate blend in one kernel)"* with pass criteria *kernel
-> numerics match eager ≤1e-3* and *end-to-end ≥1.3× decode speedup at D768*.
+> Status: **design notes + probe (2026-08-26).** No Triton source exists yet —
+> deliberately: the repo law bans fake benchmarks, and this environment is
+> CPU-only (`torch 2.13.0+cpu`), so any "kernel result" written today would be
+> fiction. What IS real here: the eager dataflow audit (§1), the measured
+> `torch.compile` probe (§3), the numeric verification protocol (§4), and the
+> bandwidth model (§5). The roadmap gates — *numerics ≤ 1e-3*, *≥1.3× decode
+> at D768* — stay OPEN until an A100/H100 runner executes them.
 >
-> **Honest boundary:** this environment is CPU-only (torch 2.13.0+cpu, no
-> CUDA driver, `import triton` fails). No Triton kernel is committed or can
-> be executed here — by instruction this milestone delivers DESIGN NOTES +
-> the torch.compile probe only. Every number below was measured in this
-> session (§3); every performance figure in §5 is an analytical model, not a
-> GPU measurement. GPU validation is an explicit follow-up (§6).
+> Probe script (committed, rerunnable): `experiments/v6/m7_compile_probe.py`.
 
-## 0. Why the kernel still pays after M1 (scope honesty)
+## 0. Ground truth this design is anchored to
 
-M1 removed the `(B,T,V)` blend from the DEFAULT train-loss and decode-argmax
-paths (per-target exact `logaddexp` in `loss_v33`, `hmn/recipe.py:758`;
-candidate-set argmax bound in `blend_argmax`, `hmn/recipe.py:671`). The fused
-kernel therefore targets the consumers that still want a full-width blended
-distribution:
+- M1-B/C froze the semantics the kernel must reproduce EXACTLY at answer rows:
+  snapped copy lane with support only on the seed group's payloads
+  (`IRStats`, `hmn/v3.py:286`; blend argmax bound proof, `hmn/recipe.py:671`).
+  Kernels chase semantics, not the reverse — same rule that sequenced M1 → M7.
+- gpu-large spec (`experiments/v6/m4_scale_specs.py:58`): V=3190, D=768,
+  L=12, state=64, MoE top-k2. All §5 numbers use it.
+- fp32-island discipline (M3): losses/gate math stays fp32 regardless of
+  activation dtype — the kernel inherits this (fp32 accumulators mandatory).
 
-1. **HF integration** — `hmn/hf.py:161` materializes the full-vocab blend for
-   `generate()` compatibility.
-2. **Oracle/debug paths** — `--exact-blend` (`hmn/v3.py:801-809`) exists
-   precisely because the dense math remains the reference.
-3. **Full-distribution consumers** — perplexity eval, KD, sampling with copy
-   mass, and any future tokenizer growth (community 32k–128k vocabs put
-   `(B,T,V)` cost back in scope linearly).
-4. **Decode latency** — candidate scoring currently runs host-side Python
-   (`payloads_of` slices + the `blend_argmax` loop); a device-side fused
-   scorer removes the host sync.
+## 1. Fused dual-head kernel (gen log-softmax ⊕ copy ⊕ gate blend, one pass)
 
-The dense eager reference being fused (bit-faithful M1-A oracle,
-`DualHeadDecoder.forward` sparse/dense branch, `hmn/v3.py:594-597`):
+### 1.1 Eager dataflow today (what we are collapsing)
+
+Stats path per forward (`hmn/v3.py:783-790`):
 
 ```
-gen       = log_softmax(head(cat([h, gm, b], -1)))   # (B,T,V)
-copy_dist = F.normalize(copy_logits, p=1, dim=-1)     # (B,T,V)
-p         = (1 - g) * gen.exp() + g * copy_dist
-out       = log(p.clamp(min=eps))
+gen_logits = log_softmax(W_gen · [h | gm | b])        # (B,T,V)  v3.py:545
+g          = sigmoid(clamp(tau·(gate_mass − 0.5), ±6))·(1−behind)   # v3.py:551-553
 ```
 
-Semantic contract (identical value computed per element, cf. `loss_v33`):
-`out[v] = logaddexp( log(1-g) + ls[v], log(g) + log c[v] )` with `ls =
-log_softmax(gen_logits)` and `c` the copy distribution.
+Consumers split three ways:
 
-## 1. Fused dual-head kernel
-
-### 1.1 Input/output contract
-
-| operand | shape | source |
+| consumer | reads | (B,T,V) materialized? |
 |---|---|---|
-| `gen_logits` | `(B,T,V)` fp32 (bf16 allowed post-M3, fp32 island inside) | `dual.gen` head output |
-| `g` | `(B,T,1)` fp32 | deterministic or RelativeGate (`v3.py:551-553`, `v3.py:627-639`) |
-| copy support | **sparse**, NOT dense: per-row group id `col_grp[b,t]` (`v3.py:339`) into the group payload runs `(h_y, h_cnt)` + `denom` (`v3.py:389-397`); fractions `cnt/denom` | `IRStats` |
-| forced anchors | `(B,T)` long, `-100` none; anchored payload at p=1.0 one-hot (`v3.py:374-379`, `424-429`) | `IRStats.anchor_pay` |
-| **out** | `(B,T,V)` fp32 blended log-probs | kernel |
+| train CE `loss_v33` (`recipe.py:706`) | `gen_logits.gather(y)` ⊕ `st.prob_at(y)` via scalar `logaddexp` | NO (M1-C) |
+| HF export `_blended_logprobs` (`hmn/hf.py:114-162`) | builds `p_copy` (zeros+scatter), `lp_c=log(p_copy)`, `out=logaddexp(...)` | YES — three tensors |
+| decode `decode_v33`/`blend_argmax` (`recipe.py:671`) | `{gen argmax} ∪ payloads_of(t)` scored exactly | NO |
 
-Key structural fact: after M1's twins-uniform snap the copy lane has support
-only on the seed group's payloads `P` (typically `|P| ≪ V`). The kernel must
-NOT take a dense `(B,T,V)` copy input — that would reintroduce the
-materialization M1 removed.
+The dense-oracle path (`DualHeadDecoder.forward`, `v3.py:594-597`) additionally
+materializes `copy_dist`, `gen.exp()`, `p`, `log(p)` — four more round-trips.
+The fused kernel targets the `_blended_logprobs` contract (full-vocab blended
+log-probs) and the decode epilogue; training keeps the M1-C gather form,
+which the kernel also serves by emitting `blended[y]` rows on demand
+(same kernel, V-tile masked to the target column).
 
-### 1.2 Algorithm (design, not code)
+### 1.2 Kernel I/O contract
 
-One program per `(b,t)` row; `V` walked in `BLOCK_V` lanes (V=3190 → 4 tiles
-at 1024):
+Inputs (all prebuilt by existing torch code — nothing data-dependent crosses
+the kernel boundary):
 
-1. **Sweep 1 (softmax + stash):** stream `gen_logits` tiles once; maintain
-   running `(m, s)` online-softmax state; write `e_v = exp(z_v − m_run)`
-   (rescaled on `m` updates) into an **SMEM buffer of `V` fp32** = 12.8 KB at
-   V=3190 (fits the 48 KB static budget alongside staging). This makes the
-   pass truly "one pass over HBM", per the roadmap phrasing.
-2. **Histogram stage:** zero-init a second SMEM region (or reuse after
-   barrier), scatter the row-group's `P` fractions (`cnt/denom`) — `P` loads
-   are a few dozen bytes. Forced rows skip this: `c_v = [v == anchor]`.
-3. **Sweep 2 (blend, SMEM-resident):** per lane,
-   `out_v = logaddexp(log1p(-g) + (log e_v − log s_final),
-   log(g) + log c_v)`, then the exact eager clamp semantics
-   `out_v = max-blend … log(max(p_v, eps))`. Lanes beyond V tail-masked.
-   `logaddexp` implemented as `max + log1p(exp(−|Δ|))` to mirror
-   `torch.logaddexp`.
-4. Single `(B,T,V)` HBM write of `out`.
+| operand | shape / dtype | source |
+|---|---|---|
+| `h` | (B,T,D) bf16/fp32 | WR output |
+| `gate_mass`, `behind` | (B,T) fp32 / bool | `st.mass_same`, `st.behind` |
+| `W_gen` | (V, D+2) bf16 | `dual.gen.weight` ([h,gm,b] layout, tie_embed respected upstream) |
+| `tau` | scalar fp32 | `dual.tau` (learned; relative-gate variant → precompute g on host instead, see below) |
+| copy CSR | `row_ptr` (B·T+1) i32, `pay_ids` (Σ\|P\|) i32, `pay_fr` (Σ\|P\|) f32 | derived host-side in one `torch.diff/cumsum` from the already-sorted `(h_key,h_bnd,h_cnt,h_y)` histograms + `denom` |
+| forced anchors | `forced` (B,T) i64, `anchor_pay` (B,T) i64 | `st.forced`, `st.anchor_pay` |
 
-Fallback for V > smem budget (≥32k vocabs): drop the SMEM stash, do TWO HBM
-passes over `gen_logits` (re-read in sweep 2), or Option B: per-lane binary
-search into the sorted unique histogram keys (`h_key` layout already sorted
-by construction, `v3.py:386-390`) — `log2|P|` probes, no smem. Decision by
-measurement at target vocab; default Option A/smem for V ≤ 16k.
+Output: `log_p` (B,T,V) fp32 — the ONLY vocab-wide tensor allocated.
 
-### 1.3 Backward (cheap for a pleasant reason)
+Row-run ranges (`row_ptr`) are a pure re-index of `IRStats`' flat histogram:
+rows of group g inherit g's `[lo,hi)` run slice (`_run_slice`,
+`v3.py:431-441`) — O(B·T) searchsorted on the host, no new semantics.
 
-Post M1-B, copy fractions are integer-count-derived **constants w.r.t.
-parameters** (raw-id histograms) — gradient flows only through `gen_logits`
-and `g`. With `p_v = (1−g)e^{ls_v} + g·c_v`:
+### 1.3 Single-pass math per row t
 
-```
-r_v      = grad_out_v · (1−g) / p_v                      (c_v = 0 rows: p=(1−g)e^{ls})
-grad_z_u = e^{ls_u} · ( r_u − Σ_v r_v e^{ls_v} )          # softmax Jacobian
-grad_g   = Σ_v grad_out_v · (c_v − e^{ls_v}) / p_v
-```
+Non-normative pseudocode (math spec, not Triton):
 
-Phase 1: `torch.autograd.Function` with fused forward, saving `(e, s, p)`
-and computing backward with standard tensor ops. Phase 2: fused backward
-kernel. **Determinism is mandatory**: `ReversibleFunction.backward`
-(`hmn/v2.py:143-163`) RE-RUNS block forwards during backward, so any
-atomics/nondeterministic reduction inside a fused kernel used in blocks
-would desynchronize the reversible reconstruction. No atomics anywhere.
-
-### 1.4 Edge cases (each maps to a test in §4)
-
-- `g ∈ {0, 1}`: clamp exactly like `loss_v33` — `log1p(-g.clamp(max=1-1e-7))`,
-  `log(g.clamp(min=1e-12))` (`recipe.py:758-759`); deterministic gate is born
-  in [0.0025, 0.9975] but the learned gate is unbounded.
-- Empty payload group (`P = ∅`): `c_v ≡ 0`, copy term `-inf`,
-  `logaddexp` degenerates to the gen lane — never NaN.
-- Forced/stem/seam rows: one-hot copy at `anchor_pay`, `g` irrelevant
-  (matches dense one-hot attention semantics, `v3.py:424-429`).
-- `p < eps` floor rows: reproduce `log(max(p, eps))` exactly (reachable when
-  g→1 and target ∉ P).
-- `V % BLOCK_V ≠ 0`: tail masking; `-inf` masked logits flow through as
-  `exp(-inf)=0`.
-- ASI/EOS illegal payloads are already excluded upstream (`col_ok`,
-  `v3.py:324-325`) — kernel trusts the histogram.
-
-### 1.5 Decode variant
-
-At B=T=1 the whole problem is 3190 elements — launch-latency-bound, not
-bandwidth-bound. Two-step plan: (a) standalone kernel captured in a CUDA
-graph together with the rest of the step; (b) later, epilogue fusion into
-the head GEMM (persistent kernel consumes accumulator tiles directly),
-removing one full logits write+read and a launch. Phase (b) is where the
-≥1.3× decode criterion most plausibly lands at V=3190 (see §5).
-
-## 2. Optional: fused SelectiveSSM forward (`hmn/v2.py:22-104`)
-
-Current `_chunked_scan` materializes ≥8 `(B,T,D/2,S)` fp32 intermediates
-(`log_da` (+clamped copy), `db`, `L`, `eL_inv`, `Sf`, `f`, `A_chunk`,
-`B_chunk`, `h_ins`, `h`). This is the LARGEST bandwidth term in training —
-see §5 — which is why the roadmap marks it optional-but-attractive.
-
-Kernel shape (mirrors the existing exact two-phase closed form, `v2.py:47-90`):
-grid `(B·n_chunks, D/(BLOCK_D))`; each program walks its chunk's `C=8`
-positions sequentially with the state vector in registers, emitting `h`
-tiles; cross-chunk carries `A_chunk/B_chunk` go through a small workspace
-`(B, n_chunks, D, S)`; phase 2 connects chunks exactly as today.
-
-Numerics contract to replicate BIT-CLOSELY (all already documented in code):
-`clamp(log_da, min=-9.0)` applied BEFORE the cumsum; padding uses
-`dA=1, dB=0`; identical op order in the closed form; fp32 purity bounds
-`|L| ≤ 72 < 88` hold unchanged (`v2.py:56-66`).
-
-Interop risks: (i) called twice per step under reversible recompute — same
-determinism requirement as §1.3; (ii) prior art exists (`mamba_ssm`
-`selective_scan_*`, causal-conv1d kernels) — adopt-vs-write must be decided
-by measuring those FIRST on A100 against this exact recurrence; (iii) the M4
-open question "attention-WR vs SSM-WR at D≥512" gates the effort: if WR
-switches to attention, FA kernels replace this entirely. **Recommendation:
-measure `mamba_ssm` + torch.compile-on-scan before writing anything; the
-compile probe below suggests inductor may already fuse much of the
-elementwise scaffolding around the small phase-2 loop.**
-
-## 3. torch.compile probe — MEASURED RESULTS (2026-08-26)
-
-Environment: torch **2.13.0+cpu**, Python 3.12, Linux x86_64, **CPU-only**
-(no CUDA driver; `import triton` → ModuleNotFoundError). Inductor ran its
-CPU C++/OpenMP backend. Probe script (condensed, fully self-contained):
-
-```python
-import time, torch, torch.nn.functional as F
-from hmn.v3 import HMN3                       # repo root on sys.path
-
-m  = HMN3(vocab_size=3190, dim=96, state_dim=8, n_layers=3, use_moe=False,
-          gate_bias=-1.0, asi_id=5).eval()
-ids = torch.randint(6, 2000, (4, 512)); ids[:, 256] = 5
-def bench(fn, x, warmup=3, iters=10):
-    for _ in range(warmup): fn(x)
-    t0 = time.perf_counter()
-    for _ in range(iters): fn(x)
-    return (time.perf_counter() - t0) / iters * 1e3
-with torch.no_grad():
-    ms_eager = bench(m, ids)
-    cm = torch.compile(m, dynamic=False)
-    t0 = time.perf_counter(); cm(ids); compile_s = time.perf_counter()-t0
-    ms_comp = bench(cm, ids, warmup=2)
-print(ms_eager, ms_comp, ms_eager/ms_comp, compile_s)
-
-# dual-head blend region (the kernel target), exact v3.py:594-597 math
-def blend(z, cm_, g, eps=1e-8):
-    gen = torch.log_softmax(z, -1)
-    cd  = F.normalize(cm_, p=1, dim=-1)
-    return torch.log(((1 - g) * gen.exp() + g * cd).clamp(min=eps))
-z  = torch.randn(8, 1024, 3190) * 4
-cm_= torch.zeros(8, 1024, 3190).scatter_add_(
-        -1, torch.randint(0, 3190, (8, 1024, 16)), torch.rand(8, 1024, 16))
-g  = torch.rand(8, 1024, 1)
+```text
+x_t   = concat(h[t], gate_mass[t], behind[t])            # D+2, loaded once
+# phase A — online logsumexp while streaming the V dimension:
+m     = -inf; s = 0
+for V-tile: z = W_gen[tile] @ x_t                        # fp32 acc
+            m_new = max(m, max(z));  s = s·exp(m−m_new) + Σexp(z−m_new);  m = m_new
+lse   = m + log(s)
+# phase B — second stream over V (weights resident in L2 from phase A):
+for V-tile: gen_lp = z − lse
+            if forced[t] ≥ 0:  lp = (y == anchor_pay[t]) ? 0 : −inf
+            else:
+              c = pay_fr[row_ptr[t]..row_ptr[t+1]] lookup for y ∈ P_t   # SMEM map
+              lp = logaddexp(log(1−g) + gen_lp,
+                             y ∈ P_t ? log(g) + log(c) : −inf)   # snapped lane
+            write log_p[t, tile] = lp
 ```
 
-Results (wall-clock, `no_grad`, eval mode):
+Two facts make this genuinely one-pass-cheap rather than a rewrite of the
+dense scatter:
 
-| probe | config | eager | compiled | speedup | 1st-call compile | max abs diff |
-|---|---|---|---|---|---|---|
-| `hasattr(torch,'compile')` | — | — | **True** | — | — | — |
-| identity lambda compiles | — | — | **works** | — | — | — |
-| `HMN3.forward` | cpu-small D96/L3/S8, B4 T512 | 935.40 ms | 756.52 ms | **1.24×** | 153.1 s | gen 9.2e-05, gate **0.0** |
-| `HMN3.forward` | gpu-large SLICE D768/S64/**L2**, B1 T384 | 3165.40 ms | 2754.40 ms | **1.15×** | 53.5 s | gen 9.2e-04, gate **0.0** |
-| blend region (§ target) | `(8,1024,3190)` fp32 (105 MB/tensor) | 836.34 ms | 805.57 ms | **1.04×** | 1.1 s | **1.5e-05** |
+1. **Out-of-support rows are free**: post-M1 snap, `p_copy(y)=0` for
+   y ∉ P_t, so `logaddexp` degenerates to `log(1−g)+gen_lp` — no copy term,
+   no scatter, no renormalization pass.
+2. **Forced rows** are a one-hot select on `anchor_pay` (mass 1.0), matching
+   `v3.py:424-429` exactly.
 
-Graph-break census (`torch._dynamo.explain`): **14 breaks per forward** in
-both configs. First break: `Tensor.item()` on `int(grp_sorted.max())`
-(`hmn/v3.py:337`) — i.e. the IR index build; root causes are the
-data-dependent scalars and control flow (`sel.numel()`, `fm.any()`,
-searchsorted-derived Python ints, dynamic shapes from sorts) in `IRStats`.
+The deterministic gate (`sigmoid(clamp(τ·(gm−0.5),±6))`, times `(1−behind)`)
+is computed inline per row in fp32 — τ≈12 saturation is exactly why the clamp
+MUST be reproduced inside the kernel, not approximated by the sigmoid's
+natural saturation. If `gate_mode="relative"` (`RelativeGate`, `v3.py:600`),
+g is produced by the small MLP on host/torch first and passed in as (B,T);
+the kernel takes g as an input. One kernel, two gate front-ends.
 
-Findings, stated plainly:
+### 1.4 Tiling sketch
 
-1. Whole-forward compile is a free **1.15–1.24× on CPU**, capped by the 14
-   IRStats graph breaks (WR blocks + head do get fused). Cheap follow-ups:
-   `torch._dynamo.config.capture_scalar_outputs = True`, and/or deliberately
-   excluding `IRStats` from compilation (it is index bookkeeping, not FLOPs).
-2. The blend region compiles to only **1.04× on CPU** — the chain is
-   DDR-bandwidth-bound and eager already streams it near optimally. **This
-   does NOT predict the GPU case**: the Triton kernel's value on A100/H100 is
-   eliminating multiple ~100 MB-class HBM round trips (§5), which a CPU probe
-   cannot exhibit. The CPU probe validates NUMERICS (1.5e-05 ≪ 1e-3 ✓), not
-   the speedup thesis.
-3. Parity of the compiled D768 whole-forward is **9.2e-04** — inside the M7
-   ≤1e-3 budget but uncomfortably close (inductor GEMM/reduction reordering).
-   On GPU, validate against the dense oracle with TF32 disabled and re-check.
-4. Compile cost 53–153 s per graph: fine for training jobs, unacceptable
-   cold-start per decode request → precompile/AOT-cache in serving.
+- Grid: `(ceil(T/T_tile), ceil(V/V_tile))`, e.g. T_tile=8 rows/program,
+  V_tile=512 columns. Each program holds ≤8 row vectors of D+2 = 770 fp32 in
+  registers/smem (~24 KB) and streams its V-tile of `W_gen`.
+- Phase A/B two-stream trick: at T·V=2048·3190 the whole `W_gen` (bf16,
+  4.9 MB) sits in L2 after the first stream, so the second stream is L2-bandwidth,
+  not HBM. Alternative single-stream variant: keep running (m,s) AND stash
+  per-tile partial z in smem when V_tile·T_tile fits (512·8·4B = 16 KB) —
+  preferred; falls back to two-stream at larger tiles.
+- Decode specialization (B=T=1): grid collapses to V-tiles only;
+  additionally score just `{gen_argmax} ∪ P` for argmax mode
+  (`blend_argmax` semantics) without writing any (1,V) tensor.
 
-Roadmap reconciliation: §2.6 scheduled this probe "in M4"; it is delivered
-here alongside M7 as instructed — M4 records may reference this section.
+### 1.5 Memory accounting — the "avoids 3 separate (B,T,V)" claim, quantified
 
-## 4. Kernel numerics: verifying ≤1e-3 vs eager
+Eager `_blended_logprobs` chain, counted as full (B,T,V)-sized R/W passes
+(fp32 islands): logits write 1, log_softmax R+W 2, `p_copy` zero-init 1,
+clamp+log R+W 2, logaddexp R(genp)+R(lp_c)+W(out) 3 ⇒ **9 passes**, with 4
+tensors live simultaneously at peak.
 
-**Reference definition:** the dense oracle (`--exact-blend`, bit-faithful
-pre-M1 math per M1-A/B) IS the eager ground truth. Verification ladder:
+Fused kernel: `h` read O(B·T·D) + `W_gen` read (L2-resident) + sparse copy
+runs + **1 write** ⇒ ~1.6 vocab-sized passes equivalent, 1 live tensor.
 
-1. **Unit:** randomized `gen_logits`/`g`/histograms (incl. realistic
-   skew: logits scaled ×4) → assert `max|kernel − DualHeadDecoder.dense| ≤
-   1e-3`. Expected fp32 residual ~1e-6; the budget is spent on `tl.exp`/
-   libdevice ULP differences and online-vs-two-pass reduction order.
-2. **Adversarial:** g→{0,1⁻}; empty payload groups; forced-anchor rows;
-   constructed `p ≈ eps` floor rows; `V % BLOCK_V ≠ 0` tails; `-inf` masked
-   columns; bf16-input mode compared against a **bf16** eager reference
-   (declared separately — never mix references).
-3. **Properties:** `logsumexp(out, dim=-1) == 0 ± 1e-3` per row (both lanes
-   normalized ⇒ blend is normalized); monotonicity of `argmax out` in `g`
-   toward the copy support.
-4. **Behavioral:** guardrail suites through a kernel-backed decode switch —
-   same gate as M1-B: slot_v4/chain_v4 40/40 (gate 0.775), chain/reorder
-   1.000, v5 M3/M4 suites green.
-5. **Determinism:** repeated runs bitwise-equal (required by reversible
-   recompute, §1.3/§2).
-6. **GPU acceptance adds:** on-device eager-vs-kernel diff DISTRIBUTION
-   (p50/p99), not just max; TF32 off for the fp32 comparison.
+Per forward, B=1, T=2048, fp32:
 
-## 5. Performance model @ D768 (analytical, not measured)
+| V | one (B,T,V) | eager chain (≈9 passes) | fused (≈1.6 equiv.) | peak live tensors |
+|---|---|---|---|---|
+| 3190 (gpu-large) | 26.1 MB | ≈235 MB | ≈42 MB | 4 → 1 |
+| 32 768 | 268 MB | ≈2.4 GB | ≈430 MB | 4 → 1 |
+| 131 072 | 1.07 GB | ≈9.6 GB | ≈1.5 GB | 4.3 GB → 1.07 GB |
 
-Spec constants (`experiments/v6/m4_scale_specs.py:58-62`): V=3190, D=768,
-L=12, S=64, MoE top-k2. Canonical train shape B=8, T=2048; fp32 = 4 B/elem.
-A100 HBM ≈ 1.55 TB/s (H100 ≈ 3.35 TB/s).
+At the shipped V=3190 the absolute saving is modest (~190 MB/fwd @T=2048);
+the design pays off at community vocab scale (§5) and at decode-launch level
+(§1.4/§5.3). Stated plainly so nobody expects a 2× end-to-end win from this
+kernel alone at V=3190.
 
-**(a) Dual-head stage, training shape.** One `(B,T,V)` tensor =
-8·2048·3190·4 B = **208.9 MB**. Eager chain traversals (read+write per op):
-GEMM write 209; `log_softmax` 418; `.exp()` 418; `F.normalize` 418; blend
-627; `clamp` 418; `log` 418 ⇒ ≈ **2.93 GB** HBM traffic. Fused kernel
-(one-pass, §1.2): GEMM write 209 + read 209 + write 209 ≈ **0.63 GB**
-(⇒ ~4.6× stage traffic cut; ~14× if the head GEMM epilogue absorbs the
-kernel entirely). Time: ~1.9 ms → ~0.41 ms per forward at A100 bandwidth.
-**Honest framing:** against a full L=12 step this stage is single-digit % of
-step time — dual-head fusion primarily serves the §0 consumers
-(HF/eval/sampling), not overall train throughput.
+## 2. Optional: fused SelectiveSSM forward
 
-**(b) Decode, B=T=1.** Per-tensor 12.8 KB — entirely launch/sync-bound
-(~µs-scale op overhead × dozens of ops, plus the host-side candidate loop in
-`blend_argmax`). The ≥1.3× decode criterion at V=3190 decomposes roughly:
-CUDA-graph/compile capture of the whole step (largest lever, §3 finding 4),
-device-side candidate scoring removing host syncs, epilogue fusion saving a
-launch. At community vocab sizes (32k+: 128 KB/tensor, ~7 traversals ≈ 1.8 MB
-per row per beam) bandwidth starts to matter even at T=1 — the kernel's
-margin grows with V.
+Motivation first — this is the BIGGER bandwidth fish. The chunked closed-form
+scan (`_chunked_scan`, `hmn/v2.py:47-90`) materializes per call: padded
+`log_da`,`db`; `L`; `eL_inv`; `Sf`; `f`; `A_chunk`,`B_chunk`,`h_ins`,`h` —
+each (B,T,D,S) fp32. At D=768, S=64, T=2048, B=1 one such tensor is
+**402.7 MB**; peak ~5 concurrent ⇒ ~2 GB transient allocations and ~8 passes
+(~3.2 GB traffic) per `SelectiveSSM.forward`. Each coupling layer calls it
+twice (F1/F2 at D/2) × 12 layers ⇒ tens of GB of intermediate traffic per
+training forward. The recurrence itself is trivial arithmetic; the cost is
+entirely tensor round-trips.
 
-**(c) SelectiveSSM stage, training shape — the dominant term.** Per
-half-SSM call at D/2=384, S=64: one `(B,T,384,64)` tensor = 8·2048·384·64·4 B
-= **1.61 GB**; `_chunked_scan` writes ≥8 of them (plus comparable reads) ⇒
-order **25 GB traffic per SSM call**, ×2 halves ×L=12 layers ⇒ hundreds of
-GB per forward — dwarfing (a). Fused scan: streaming tiles + carry workspace
-`(B,n_chunks,384,64)` = 201 MB ⇒ ~10× cut on the dominant term.
-**Priority order for actual kernel-writing effort: (1) SSM scan fusion,
-(2) decode/epilogue path, (3) standalone dual-head blend kernel.**
+Design (two kernels, preserving v2.4's closed-form exactly):
 
-**(d) Roofline sanity.** The blend math is ~12 flops/elem over ~8 B/elem of
-traffic ⇒ arithmetic intensity ≈ 1.5 flops/B vs the A100 ridge point
-(~200:1): deeply memory-bound. Confirms the optimization strategy is
-*minimize traversals*, not FLOPs — exactly what fusion buys.
+- **Phase 1 (per-chunk)**: grid over (b, chunk, d_slice). In-program
+  sequential scan over C=8 positions computes `L=cumsum(log_da)`,
+  `Sf=cumsum(db·e^{−L})`, `f=e^L·Sf`, and emits chunk aggregates
+  `(A_chunk,B_chunk)` — all in registers/SMEM. With d_slice=64, a position
+  tile is 64×64×4B = 16 KB; C=8 positions ≈ 128 KB — borderline vs 164 KB
+  A100 SMEM ⇒ loop d_slices inside the program (state slice resident,
+  positions streamed). Only `f`, `A_chunk`, `B_chunk` go to HBM.
+- **Phase 2 (inter-chunk)**: exact sequential connect `h_in ← A_c·h_in+B_c`
+  over n_chunks=T/8. Two options, decided by measurement: (a) persistent
+  kernel with cooperative grid sync (one launch, n_chunks in-kernel steps);
+  (b) keep the tiny host loop of `torch` scalar-tensor ops as today
+  (n_chunks=256 launches of (D,S)-sized work is launch-bound — option (a)
+  exists precisely to kill this).
+- **Output fusion**: contract `y = Σ_s h·C_m + D⊙x` inside phase 1's epilogue
+  so `h` (B,T,D,S) is NEVER written — output drops to (B,T,D). This alone
+  deletes ~half the phase-1 traffic; combined, projected ~25–50× traffic cut
+  per call (exact number is a measurement, not a claim).
+- Numerics invariants carried verbatim from `v2.py`: `clamp(min=−9)` on
+  `log_da` BEFORE cumsum (purity note: |L| ≤ 72 < 88 fp32 exp range);
+  padding rows dA=1/dB=0; fp32 throughout regardless of AMP mode.
+- Backward: recompute-in-backward matches the `ReversibleFunction` pattern
+  (`v2.py:129`) — phase-1 recompute from saved `(log_da, db)` inputs only;
+  no (B,T,D,S) activations stored. Interop risk with FSDP (M5 open question)
+  applies here too; sequence: land forward numerics gate first.
 
-## 6. Exit criteria for the kernel-writing phase (follow-up)
+## 3. torch.compile probe — MEASURED (2026-08-26, this machine)
 
-Blocked on: GPU runner access; M4 open question (attention-WR vs SSM-WR).
-Acceptance: §4 ladder green; measured stage speedups within ±30 % of the §5
-model; **end-to-end decode ≥1.3× at D768 on A100** (roadmap gate). Landing
-pattern mirrors M1: kernel behind a flag (`dual.fused_kernel="triton"|None`),
-dense oracle path retained for parity.
+Environment: `torch 2.13.0+cpu`, CUDA: none, 4 cores (torch threads=2),
+cpu-small spec (dim=96/L=3/state=8/V=3190), stats path, eval, B=1 T=20,
+fixed shapes, `dynamic=False`, median of 3×100-call batches.
+Script: `experiments/v6/m7_compile_probe.py`.
 
-### References
+```
+hasattr(torch, 'compile') -> True
+torch.compile(lambda x: x) -> compiles & runs ("compile works")
+```
 
-- Dense blend reference: `hmn/v3.py:556-597` (`DualHeadDecoder`)
-- Stats/copy-lane structures: `hmn/v3.py:286-455` (`IRStats`)
-- Per-target blend CE / candidate bound: `hmn/recipe.py:666-767`
-- Chunked SSM scan + purity notes: `hmn/v2.py:22-104`
-- Reversible recompute (determinism constraint): `hmn/v2.py:129-163`
-- HF blend consumer: `hmn/hf.py:150-180`
-- D768 spec constants: `experiments/v6/m4_scale_specs.py:42-63`
-- Roadmap item: `docs/v6_scaling_roadmap.md` §1 (M7 row), §2.6
+HMN3 forward, eager vs compiled:
+
+| metric | value |
+|---|---|
+| eager | 18–38 ms/fwd (CPU wall noise across sessions) |
+| compiled | 9–25 ms/fwd |
+| **speedup** | **1.26× – 2.80× across 3 sessions; typical ≈1.5×** |
+| first-call compile | 14–77 s |
+| max \|Δ gen_logits\| compiled vs eager | **5.341e-05** (identical every session) |
+| max \|Δ g\| | **0.0** (bitwise) |
+
+Both deltas ≤ 1e-3 ⇒ the compiled graph is numerically safe to build on.
+
+Dynamo findings that shape the whole M7 plan:
+
+1. **Graph break at `IRStats.__init__`** — `G = int(grp_sorted.max()) + 1`
+   (`v3.py:336`) is a data-dependent scalar; dynamo splits the graph around
+   IRStats and compiles embed/WR/head separately. That break is currently
+   LOAD-BEARING.
+2. **Do NOT set `TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1`**: verified failure —
+   `InductorError: LoweringException: GuardOnDataDependentSymNode: Could not
+   guard on Eq(u0 + 1, 1)`. Compilation aborts outright. Beyond the guard,
+   capturing through IRStats would also key graphs on G (group count varies
+   per batch) → recompile churn. Conclusion: **compile scope = WR block stack
+   + dual-head epilogue wrapper; never IRStats internals.**
+3. Strategy consequence for Triton: on GPU, Inductor would already fuse the
+   pointwise tail (softmax/exp/logaddexp) into its own Triton — but it cannot
+   fuse ACROSS the cuBLAS GEMM boundary, nor turn the dense `p_copy`
+   scatter+log into the sparse CSR read of §1.3. Those two things are the hand
+   kernel's entire reason to exist. If Triton is unavailable, a respectable
+   fallback is `torch.compile(DualHeadDecoder epilogue)` + accepting the
+   extra passes (numbers in §1.5 shrink but don't vanish).
+
+## 4. Kernel numerics: verifying ≤1e-3 against eager
+
+Reference oracle: `HMN3(exact_blend=True)` — the dense dual-head path M1
+deliberately kept bit-faithful — plus `IRStats.prob_at/payloads_of` for the
+snapped lane. Compare in **log space** (max-abs on blended log-probs): the
+loss consumes log-probs, and log-space diffs absorb exp/rounding noise where
+probability-space diffs would amplify near-zero masses.
+
+Protocol (mirrors M1-A/M1-C conventions):
+
+1. **Primary gate**: `max |logp_kernel − logp_eager| ≤ 1e-3` over ALL rows
+   (prompt rows included — they're declared approximate in IRStats ctx, but
+   the BLEND lane is exact there too under the snap; assert it).
+2. **Property checks** (each independently asserted):
+   - `exp(log_p).sum(-1) ∈ [1±1e-3]` per row;
+   - forced rows: argmax == `anchor_pay` exactly; mass at anchor ∈ [1±1e-6];
+   - rows with empty payload groups reduce to `log(1−g)+gen_lp` (pure gen)
+     within 1e-6 of the closed form;
+   - out-of-support columns match `log(1−g)+gen_lp` to ≤1e-6 (this pins the
+     snap semantics, not just aggregate error);
+   - gate saturation: rows with `|τ·(gm−0.5)| > 6` produce g identical to the
+     clamped eager value (bitwise target; else ≤1e-7).
+3. **Adversarial input sweep**: β ∈ {1, 12, 31, 100}; duplicate-heavy prompts
+   (whole-sequence same id); ASI-boundary rows; single-column prompts;
+   T not divisible by chunk/tile sizes; G=1 degenerate sequences.
+4. **Gate is held to a TIGHTER bar than the blend** (≤1e-6, ideally bitwise
+   on the clamped path): g multiplies the entire distribution, and M1-B
+   measured gate diff 0.0 between paths — regress that and parity suites lie.
+5. **dtype matrix**: fp32 end-to-end; bf16 activations with fp32 accumulation
+   (island rule); bf16 weights. Never bf16 accumulation in the lse.
+6. **Randomized trials**: 300 seeded random (ids, β, τ, forced-mask) cases vs
+   oracle — same shape as M1-C's brute-force validation.
+7. **End-to-end behavioral gate**: slot_v4 + chain_v4 suites through a
+   `kernel_blend=True` flag (pattern copied from `exact_blend`) must hold
+   40/40 with identical gate traces before the flag defaults anywhere.
+
+Honest boundary: Triton targets NVIDIA GPUs; this repo's CI is CPU-only.
+Steps 1–6 run first against a **pure-torch emulation of the kernel's exact
+reduction order** (two-stream online-lse of §1.3) — that validates the ALGORITHM
+and the tolerance budget without hardware. Steps on real hardware (ptxas
+behavior, tf32 defaults, denormals) need the GPU runner; the milestone's
+numeric gate closes only there. This is the same CPU-honesty M4 used.
+
+## 5. Performance model @ D768
+
+Roofline framing: A100-80GB ≈ 1.94 TB/s HBM2e peak (~1.6 TB/s achievable),
+~161 bf16-FLOP/byte ridge. The head epilogue at prefill shapes is GEMM-bound
+(AI ≈ 2T ≫ ridge at T≥512) — fusion buys the elementwise tails, NOT the GEMM;
+at decode (T=1, AI≈2) it is purely memory/latency-bound — fusion buys
+everything. So the roadmap's *decode* speedup criterion is the right one to
+chase, and prefill wins should be stated in bytes, not speedup.
+
+### 5.1 Head epilogue traffic per forward (B=1, T=2048, fp32 islands, bf16 weights)
+
+From §1.5 table: eager ≈235 MB vs fused ≈42 MB at V=3190 ⇒ ~0.12 ms saved at
+1.6 TB/s on a step whose WR+MoE compute dominates ⇒ **low single-digit %
+end-to-end at V=3190 prefill**. At V=131072: 9.6 GB vs 1.5 GB ⇒ ~5 ms saved —
+material. Peak-allocation relief (4→1 live vocab tensors) matters for
+batch-size headroom at every V: 4.3 GB → 1.07 GB transient at V=131k.
+
+### 5.2 SSM scan traffic per training forward (L=12, F1/F2, T=2048)
+
+Eager: ~(6–8)×402.7 MB × 24 calls ≈ **60–77 GB** intermediate traffic
+(≈35–45 ms of pure HBM time at 1.6 TB/s, before counting allocator pressure).
+Fused (§2 design): ~34 MB per half-D call ⇒ <2 GB total ⇒ **~30–50× traffic
+cut on the WR stack**. This — not the head — is where a prefill-visible
+speedup lives, and why §2 is "optional" only in priority, not in value.
+
+### 5.3 Decode step (B=1, T=1, D768/L12)
+
+- Bandwidth view: active-weight read dominates (multi-100 MB); head `W_gen`
+  is 4.9 MB of it ⇒ fusing the head changes almost nothing byte-wise at
+  V=3190.
+- Latency view: eager epilogue ≈ 15–20 kernel launches (channel-concat, GEMV,
+  log_softmax, clamp/sigmoid chain, scatter/normalize, exp/mul-add/log,
+  logaddexp, topk) ≈ 70–140 µs of launch/gap overhead; fused = 2 launches
+  (head kernel + candidate scorer). Whether that reaches the roadmap's ≥1.3×
+  depends on the rest of the step: the SSM decode path still runs a host
+  chunk loop and IRStats does per-step sort/searchsorted with `.item()` syncs.
+- Therefore the ≥1.3× decode criterion is credible ONLY as a COMBINED result:
+  head kernel (launch cuts) + §2 scan kernel (removes the chunk-loop stalls)
+  + optionally CUDA-graphing the whole decode step. Head-alone at V=3190 will
+  not clear it; at V≥32k it plausibly could on bandwidth alone. Measured,
+  not assumed, when hardware lands.
+
+## 6. Milestone status
+
+| M7 gate (roadmap line 100) | status |
+|---|---|
+| kernel numerics match eager ≤1e-3 | probe-level PASS for `torch.compile` (5.3e-05 / 0.0); Triton gate OPEN (needs GPU runner, §4 protocol locked) |
+| end-to-end ≥1.3× decode @ D768 | OPEN — analysis says combined-kernel result (§5.3); measurement pending |
+| design notes + probe | THIS DOC — done |
