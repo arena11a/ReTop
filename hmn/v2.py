@@ -30,13 +30,15 @@ class SelectiveSSM(nn.Module):
         phase 2: sequential loop over chunks connects chunk states
         h_j = P_j * h_in + F_j
     Python loop drops from T to (chunk_size + ceil(T/chunk_size)) steps;
-    within-chunk work is vectorized across (B, n_chunks, dim, state)."""
+    within-chunk work is vectorized across (B, n_chunks, dim, state).
+    v9 M22: chunk_size and clamp now configurable."""
 
-    def __init__(self, dim, state_dim, prenorm=True, chunk_size=8):
+    def __init__(self, dim, state_dim, prenorm=True, chunk_size=8, clamp=-9.0):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
         self.chunk_size = chunk_size
+        self.clamp = clamp
         self.ln = nn.LayerNorm(dim) if prenorm else None
         self.in_proj = nn.Linear(dim, state_dim * 2)  # B, C (input-dependent)
         self.delta_proj = nn.Linear(dim, dim)         # dt (input-dependent, per dim)
@@ -72,7 +74,7 @@ class SelectiveSSM(nn.Module):
             pad = T_pad - T
             log_da = F.pad(log_da, (0, 0, 0, 0, 0, pad), value=0.0)   # dA=1 in padding
             db = F.pad(db, (0, 0, 0, 0, 0, pad), value=0.0)          # dB=0 in padding
-        log_da = log_da.clamp(min=-9.0)
+        log_da = log_da.clamp(min=self.clamp)
         L = torch.cumsum(log_da.reshape(B, n_chunks, C, D, S), dim=2)  # (B,nc,C,D,S)
         eL_inv = torch.exp(-L)
         Sf = torch.cumsum(db.reshape(B, n_chunks, C, D, S) * eL_inv, dim=2)
@@ -107,11 +109,13 @@ class SelectiveSSM(nn.Module):
 class HelixCouplingBlock(nn.Module):
     """One reversible coupling layer (Pre-LN inside F1/F2)."""
 
-    def __init__(self, dim, state_dim, prenorm=True):
+    def __init__(self, dim, state_dim, prenorm=True, chunk_size=8, clamp=-9.0):
         super().__init__()
         half = dim // 2
-        self.F1 = SelectiveSSM(half, state_dim, prenorm=prenorm)
-        self.F2 = SelectiveSSM(half, state_dim, prenorm=prenorm)
+        self.F1 = SelectiveSSM(half, state_dim, prenorm=prenorm,
+                               chunk_size=chunk_size, clamp=clamp)
+        self.F2 = SelectiveSSM(half, state_dim, prenorm=prenorm,
+                               chunk_size=chunk_size, clamp=clamp)
 
     def forward(self, h):
         h_a, h_b = h.chunk(2, dim=-1)

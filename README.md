@@ -163,6 +163,15 @@ Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
 - **M18**: `decode_perm()` — re-seeds pointer at every seam boundary for arbitrary permutations (generalizes `decode_rotate`)
 - **M20**: Architecture combo — `HMN3AttentionWR(seam_addr=True, attn_ptr=True)` merges attention-WR + seam + attention pointer in one model
 - **M21**: KV cache — `decode_v33(..., use_kv_cache=True)` caches K/V tensors for ~T× decode speedup
+**v9.1 ✅ (configurable architecture + trainer)**: production-ready foundation:
+- **M22**: Configurable architecture — all hardcoded params moved to `HMNConfig`:
+  - IR: `ir_beta_init`, `ir_gate_threshold`, `ir_gate_clamp`, `ir_tau_init`
+  - SSM: `ssm_chunk_size`, `ssm_clamp`
+  - Attention: `rope_base`, `ffn_mult` (SwiGLU multiplier)
+  - MoE: `moe_key_dim`, `moe_capacity_factor`, `moe_z_loss_coef`
+  - Training: `grad_clip`, `weight_decay`, `optimizer`
+  - New preset: `gpu-xlarge` (D=512, L=6, ~5.5M params)
+- **Trainer class** (`hmn/trainer.py`): mixed precision (AMP), gradient accumulation, LR schedule (constant/cosine/linear + warmup), checkpoint resume, early stopping
 
 ---
 
@@ -321,12 +330,14 @@ hmn/                        core package
   v2.py                     SelectiveSSM, coupling, MoE, episodic memory
   v3.py                     IdentityRegister, DualHeadDecoder, SeedPointer, AttentionSeedPointer, HMN3
   v7.py                     HMN3AttentionWR, RMSNorm, RoPE, SwiGLU, SparseConditionalComputeV2
-  config.py                 HMNConfig + create_model factory (presets: cpu-small..attn-seam-medium)
+  config.py                 HMNConfig + create_model factory (presets: cpu-small..gpu-xlarge)
   recipe.py                 v3.3 recipe + v5 seam + v7 train() + v8 train_multitask():
                             make_chat_ids, loss_v33, decode_v33(seam, kv_cache),
                             decode_perm, train_multitask, make_reorder_batch,
                             seam_losses, eval_reorders, eval_perms,
                             resolve_device   ← single source of truth
+  trainer.py                v9 Trainer: AMP, grad accumulation, LR schedule,
+                            checkpoint resume, early stopping, TensorBoard
   eval_harness.py           v7 M11 + v8: automated eval suite (slot/chain/reorder/perm), JSON reports
   hf.py                     v6 M2: HF packaging — HMNForCausalLM, save/load pretrained
   packing.py                v6 M5: doc-masked padding, per-doc position_ids

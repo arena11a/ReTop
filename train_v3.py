@@ -147,7 +147,14 @@ def main():
     print(f"params: {sum(p.numel() for p in model.parameters()):,} | arch={args.arch} "
           f"sparse={args.sparse_marginal}", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # v9 M22: configurable optimizer and weight decay
+    grad_clip = getattr(args, "grad_clip", 5.0)
+    weight_decay = getattr(args, "weight_decay", 0.0)
+    opt_name = getattr(args, "optimizer", "adamw").lower()
+    if opt_name == "adam":
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
     lossf = nn.CrossEntropyLoss(ignore_index=-100)
     best_unseen = 0.0
     t0 = time.time()
@@ -173,7 +180,7 @@ def main():
         if hasattr(model, 'moe_aux_loss'):
             loss = loss + model.moe_aux_loss()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
 
         if step % args.eval_every == 0 or step == args.steps:

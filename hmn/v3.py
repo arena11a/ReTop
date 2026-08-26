@@ -497,7 +497,8 @@ class DualHeadDecoder(nn.Module):
     via a different mechanism (see identity-register postmortem).
     """
 
-    def __init__(self, dim, vocab, tie_embed=None, gate_bias=0.0, gate=None):
+    def __init__(self, dim, vocab, tie_embed=None, gate_bias=0.0, gate=None,
+                 gate_threshold=0.5, gate_clamp=6.0, tau_init=12.0):
         super().__init__()
         # gen takes [h, gate_mass, behind] (dim+2): the two extra channels are a
         # DIRECT boundary signal. At the last answer row gate_mass collapses to
@@ -507,7 +508,9 @@ class DualHeadDecoder(nn.Module):
         # Linear(h) and ~1-2/40 unseen slots flip the EOS decision per seed.
         self.gen = nn.Linear(dim + 2, vocab, bias=False)
         self.gate_bias = gate_bias
-        self.tau = nn.Parameter(torch.tensor(12.0))
+        self.tau = nn.Parameter(torch.tensor(float(tau_init)))
+        self.gate_threshold = gate_threshold
+        self.gate_clamp = gate_clamp
         # v4 M2: pluggable learned gate (RelativeGate); None keeps the
         # deterministic same-token-id gate that is v3.3-final.
         self.gate = gate
@@ -537,8 +540,8 @@ class DualHeadDecoder(nn.Module):
             margin = (top2[0][..., 0] - top2[0][..., 1]).detach()
             g = self.gate(h, gate_mass, margin, behind, n_legal)
         else:
-            g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - 0.5))
-                              .clamp(-6.0, 6.0))
+            g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - self.gate_threshold))
+                              .clamp(-self.gate_clamp, self.gate_clamp))
             g = g * (1.0 - b)                      # prompt/ASI rows: gen
         return gen, g
 
@@ -557,9 +560,9 @@ class DualHeadDecoder(nn.Module):
                 g = self.gate(h, gate_mass, margin, behind, n_legal)
             else:
                 # deterministic same-token-id gate (see class docstring).
-                # threshold 0.5 fixed: exact twin ~0.99, boundary ~0.
-                g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - 0.5))
-                                  .clamp(-6.0, 6.0))
+                # threshold and clamp now configurable (v9 M22).
+                g = torch.sigmoid((self.tau * (gate_mass.unsqueeze(-1) - self.gate_threshold))
+                                  .clamp(-self.gate_clamp, self.gate_clamp))
                 g = g * (1.0 - b)                      # prompt/ASI rows: gen
         else:
             # legacy path (no attn provided): fall back to a static open gate
@@ -763,7 +766,11 @@ class HMN3(nn.Module):
                  gate_bias=0.0, aux_copy=True, asi_id=None,
                  sparse_marginal=False, gate_mode="deterministic", user_id=None,
                  stem_addr=False, seam_addr=False, max_run=16,
-                 exact_blend=False, attn_ptr=False):
+                 exact_blend=False, attn_ptr=False,
+                 ir_beta_init=30.0, ir_gate_threshold=0.5, ir_gate_clamp=6.0, ir_tau_init=12.0,
+                 ssm_chunk_size=8, ssm_clamp=-9.0,
+                 rope_base=10000.0, ffn_mult=4.0,
+                 moe_key_dim=16, moe_capacity_factor=1.25, moe_z_loss_coef=0.001):
         super().__init__()
         # v6 M1-B: False (default) = index/stats path (no (B,T,T)/(B,T,V));
         # True = legacy dense oracle (bit-faithful pre-M1 behavior) for parity
@@ -771,7 +778,8 @@ class HMN3(nn.Module):
         self.exact_blend = exact_blend
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
-            [HelixCouplingBlock(dim, state_dim) for _ in range(n_layers)]
+            [HelixCouplingBlock(dim, state_dim, chunk_size=ssm_chunk_size,
+                                clamp=ssm_clamp) for _ in range(n_layers)]
         )
         self.moe_off = nn.Identity()
         self.use_moe = use_moe
@@ -786,7 +794,10 @@ class HMN3(nn.Module):
         gate = RelativeGate(dim, gate_bias) if gate_mode == "relative" else None
         self.dual = DualHeadDecoder(dim, vocab_size,
                                     tie_embed=self.embed.weight if tie_weights else None,
-                                    gate_bias=gate_bias, gate=gate)
+                                    gate_bias=gate_bias, gate=gate,
+                                    gate_threshold=ir_gate_threshold,
+                                    gate_clamp=ir_gate_clamp,
+                                    tau_init=ir_tau_init)
         self.use_think = use_think
         self.think = LatentThinkingBuffer(dim, k_max) if use_think else None
         self.aux_copy = aux_copy

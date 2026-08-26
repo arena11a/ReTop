@@ -1,4 +1,4 @@
-"""HMN configuration and model factory (v7).
+"""HMN configuration and model factory (v9).
 
 Easy model creation:
     from hmn import HMNConfig, create_model
@@ -69,6 +69,27 @@ class HMNConfig:
     # v8 M20: attention-based seed pointer (when seam_addr=True)
     attn_ptr: bool = False
 
+    # --- v9 M22: configurable architecture params ---
+    # IR (IdentityRegister) params
+    ir_beta_init: float = 30.0
+    ir_gate_threshold: float = 0.5
+    ir_gate_clamp: float = 6.0
+    ir_tau_init: float = 12.0
+    # SSM (SelectiveSSM) params
+    ssm_chunk_size: int = 8
+    ssm_clamp: float = -9.0
+    # Attention params
+    rope_base: float = 10000.0
+    ffn_mult: float = 4.0  # SwiGLU hidden multiplier
+    # MoE params (SparseConditionalComputeV2)
+    moe_key_dim: int = 16
+    moe_capacity_factor: float = 1.25
+    moe_z_loss_coef: float = 0.001
+    # Training params
+    grad_clip: float = 5.0
+    weight_decay: float = 0.0
+    optimizer: str = "adamw"
+
     # --- presets ---
 
     PRESETS = {
@@ -76,6 +97,7 @@ class HMNConfig:
         "gpu-small": {"dim": 64, "state_dim": 8, "n_layers": 2, "variant": "ssm"},
         "gpu-medium": {"dim": 128, "state_dim": 16, "n_layers": 3, "variant": "ssm"},
         "gpu-large": {"dim": 256, "state_dim": 32, "n_layers": 4, "variant": "ssm"},
+        "gpu-xlarge": {"dim": 512, "state_dim": 64, "n_layers": 6, "variant": "ssm"},
         "attn-small": {"dim": 64, "n_layers": 2, "variant": "attention"},
         "attn-medium": {"dim": 128, "n_layers": 3, "variant": "attention"},
         "attn-large": {"dim": 256, "n_layers": 4, "variant": "attention"},
@@ -99,13 +121,14 @@ class HMNConfig:
         return cls(**cls.PRESETS[name], **overrides)
 
     def param_count_estimate(self) -> int:
-        """Rough parameter count (exact depends on MoE/seam config)."""
+        """Rough parameter count (exact depends on MoE/seam/attn_ptr config)."""
         d, V, L = self.dim, self.vocab_size, self.n_layers
         embed = V * d
         if self.variant == "attention":
-            # AttentionBlock: QKV (3d^2) + out (d^2) + SwiGLU (2*d*4d=8d^2)
-            # + 2x RMSNorm (2d) = 12d^2 + 2d per layer
-            backbone = L * (12 * d * d + 2 * d)
+            # AttentionBlock: QKV (3d^2) + out (d^2) + SwiGLU (2*d*(ffn_mult*d)=2*ffn_mult*d^2)
+            # + 2x RMSNorm (2d) = (4 + 2*ffn_mult)*d^2 + 2d per layer
+            ffn_d2 = 2 * self.ffn_mult * d * d
+            backbone = L * (4 * d * d + ffn_d2 + 2 * d)
         else:
             # HelixCouplingBlock: 4 coupling params per layer
             backbone = L * (4 * d * d + 4 * d * self.state_dim)
@@ -114,8 +137,15 @@ class HMNConfig:
         moe = 0
         if self.use_moe:
             n_sub = int(self.n_experts ** 0.5)
-            moe = L * (d * 16 + n_sub * 16 + self.n_experts * d)
-        return embed + backbone + head + ir + moe
+            moe = L * (d * self.moe_key_dim + n_sub * self.moe_key_dim + self.n_experts * d)
+        # SeedPointer params: q (d^2) + len_head (d*max_run) + beta
+        seam = 0
+        if self.seam_addr:
+            seam = d * d + d * self.max_run + 1
+        if self.seam_addr and self.attn_ptr:
+            # AttentionSeedPointer: q/k/v/out projections (4*d^2) + len_head + temp
+            seam = 4 * d * d + d * self.max_run + 1
+        return embed + backbone + head + ir + moe + seam
 
 
 def create_model(config, asi_id=None, user_id=None, **overrides):
@@ -159,6 +189,18 @@ def create_model(config, asi_id=None, user_id=None, **overrides):
         "max_run": config.max_run,
         "exact_blend": config.exact_blend,
         "attn_ptr": config.attn_ptr,
+        # v9 M22: architecture params
+        "ir_beta_init": config.ir_beta_init,
+        "ir_gate_threshold": config.ir_gate_threshold,
+        "ir_gate_clamp": config.ir_gate_clamp,
+        "ir_tau_init": config.ir_tau_init,
+        "ssm_chunk_size": config.ssm_chunk_size,
+        "ssm_clamp": config.ssm_clamp,
+        "rope_base": config.rope_base,
+        "ffn_mult": config.ffn_mult,
+        "moe_key_dim": config.moe_key_dim,
+        "moe_capacity_factor": config.moe_capacity_factor,
+        "moe_z_loss_coef": config.moe_z_loss_coef,
     }
     for k, v in overrides.items():
         cfg_dict[k] = v
@@ -183,6 +225,16 @@ def create_model(config, asi_id=None, user_id=None, **overrides):
             use_checkpoint=config.use_checkpoint,
             dropout=config.dropout,
             attn_ptr=cfg_dict["attn_ptr"],
+            # v9 M22: architecture params
+            ir_beta_init=cfg_dict["ir_beta_init"],
+            ir_gate_threshold=cfg_dict["ir_gate_threshold"],
+            ir_gate_clamp=cfg_dict["ir_gate_clamp"],
+            ir_tau_init=cfg_dict["ir_tau_init"],
+            rope_base=cfg_dict["rope_base"],
+            ffn_mult=cfg_dict["ffn_mult"],
+            moe_key_dim=cfg_dict["moe_key_dim"],
+            moe_capacity_factor=cfg_dict["moe_capacity_factor"],
+            moe_z_loss_coef=cfg_dict["moe_z_loss_coef"],
         )
     else:
         return HMN3(**cfg_dict)

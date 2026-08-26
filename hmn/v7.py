@@ -128,11 +128,12 @@ class RMSNorm(nn.Module):
 
 
 class RotaryPositionEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE) for attention."""
+    """Rotary Position Embedding (RoPE) for attention.
+    v9 M22: base frequency now configurable."""
 
-    def __init__(self, dim, max_seq_len=8192):
+    def __init__(self, dim, max_seq_len=8192, base=10000.0):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._build_cache(max_seq_len)
 
@@ -161,11 +162,12 @@ class RotaryPositionEmbedding(nn.Module):
 
 
 class SwiGLUFFN(nn.Module):
-    """SwiGLU Feed-Forward Network (gated activation)."""
+    """SwiGLU Feed-Forward Network (gated activation).
+    v9 M22: hidden_dim multiplier now configurable."""
 
-    def __init__(self, dim, hidden_dim=None, dropout=0.0):
+    def __init__(self, dim, hidden_dim=None, dropout=0.0, ffn_mult=4.0):
         super().__init__()
-        hidden_dim = hidden_dim or dim * 4
+        hidden_dim = hidden_dim or int(dim * ffn_mult)
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
@@ -180,10 +182,11 @@ class AttentionBlock(nn.Module):
 
     This replaces HelixCouplingBlock for the attention-WR variant.
     NOT reversible — uses gradient checkpointing for memory efficiency.
+    v9 M22: rope_base and ffn_mult now configurable.
     """
 
     def __init__(self, dim, n_heads=None, head_dim=None, dropout=0.0,
-                 max_seq_len=8192):
+                 max_seq_len=8192, rope_base=10000.0, ffn_mult=4.0):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads or max(1, dim // 64)
@@ -197,11 +200,12 @@ class AttentionBlock(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
 
         # RoPE
-        self.rope = RotaryPositionEmbedding(self.head_dim, max_seq_len)
+        self.rope = RotaryPositionEmbedding(self.head_dim, max_seq_len,
+                                            base=rope_base)
 
         # Pre-LN for FFN
         self.ln2 = RMSNorm(dim)
-        self.ffn = SwiGLUFFN(dim, dropout=dropout)
+        self.ffn = SwiGLUFFN(dim, dropout=dropout, ffn_mult=ffn_mult)
 
     def forward(self, x, offset=0, kv_cache=None):
         B, T, D = x.shape
@@ -264,7 +268,10 @@ class HMN3AttentionWR(nn.Module):
                  gate_bias=0.0, asi_id=None, user_id=None,
                  stem_addr=False, seam_addr=False, max_run=16,
                  max_seq_len=8192, use_checkpoint=True, dropout=0.0,
-                 attn_ptr=False):
+                 attn_ptr=False,
+                 ir_beta_init=30.0, ir_gate_threshold=0.5, ir_gate_clamp=6.0, ir_tau_init=12.0,
+                 rope_base=10000.0, ffn_mult=4.0,
+                 moe_key_dim=16, moe_capacity_factor=1.25, moe_z_loss_coef=0.001):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -276,14 +283,17 @@ class HMN3AttentionWR(nn.Module):
         # Attention-WR blocks
         self.blocks = nn.ModuleList([
             AttentionBlock(dim, n_heads=n_heads, max_seq_len=max_seq_len,
-                           dropout=dropout)
+                           dropout=dropout, rope_base=rope_base, ffn_mult=ffn_mult)
             for _ in range(n_layers)
         ])
 
         # MoE (optional, uses SparseConditionalComputeV2 with improved routing)
         self.use_moe = use_moe
         self.moe_list = nn.ModuleList([
-            SparseConditionalComputeV2(dim, n_experts, top_k) if use_moe else None
+            SparseConditionalComputeV2(dim, n_experts, top_k,
+                                       key_dim=moe_key_dim,
+                                       capacity_factor=moe_capacity_factor,
+                                       z_loss_coef=moe_z_loss_coef) if use_moe else None
             for _ in range(n_layers)
         ])
 
@@ -293,7 +303,10 @@ class HMN3AttentionWR(nn.Module):
         self.ir.set_vocab(vocab_size)
         self.dual = DualHeadDecoder(dim, vocab_size,
                                     tie_embed=self.embed.weight if tie_weights else None,
-                                    gate_bias=gate_bias)
+                                    gate_bias=gate_bias,
+                                    gate_threshold=ir_gate_threshold,
+                                    gate_clamp=ir_gate_clamp,
+                                    tau_init=ir_tau_init)
         self.seam_addr = seam_addr
         # v8 M20: attention-based seed pointer when attn_ptr=True
         self.seed_ptr = (AttentionSeedPointer(dim, max_run=max_run)

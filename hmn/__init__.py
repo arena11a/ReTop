@@ -1,12 +1,14 @@
 """Helix Memory Network (HMN) — public API.
 
-Core building blocks (v7):
+Core building blocks (v9):
   backbone  : SelectiveSSM + HelixCouplingBlock + ReversibleFunction +
               SparseConditionalCompute (from hmn/v2.py)
   v3        : IdentityRegister, DualHeadDecoder, SeedPointer, HMN3 — the
               dual-register decoder with seam/stem run anchoring
   v7        : HMN3AttentionWR (attention-WR variant), RMSNorm, RoPE, SwiGLU,
               SparseConditionalComputeV2 (improved MoE routing)
+  v9        : Trainer (production training loop with AMP, grad accumulation,
+              LR schedule, checkpoint resume, early stopping)
   packing   : v6 M5 sequence packing (doc-masked padding, per-doc
               position ids, pack/unpack round trip)
   streaming : v6 M6 streaming data pipeline (jsonl reader, bounded shuffle)
@@ -20,6 +22,7 @@ from hmn.packing import (doc_masked_padding, doc_position_ids,
                          pack_sequences, unpack_outputs, pack_batch)
 from hmn.streaming import (StreamJsonlReader, BoundedBufferShuffle,
                            ChatIdConverter, InfiniteStreamDataset, pad_collate)
+from hmn.trainer import Trainer, TrainerConfig
 from hmn.v2 import (
     HelixCouplingBlock,
     ReversibleFunction,
@@ -70,6 +73,9 @@ __all__ = [
     "RotaryPositionEmbedding",
     "SwiGLUFFN",
     "AttentionBlock",
+    # v9 trainer
+    "Trainer",
+    "TrainerConfig",
     # packing
     "pack_sequences",
     "doc_masked_padding",
@@ -86,4 +92,4 @@ __all__ = [
     "load_compat",
 ]
 
-__version__ = "0.8.3"
+__version__ = "0.9.1"

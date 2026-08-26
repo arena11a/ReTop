@@ -781,6 +781,126 @@ def test_v8_kv_cache():
     check(isinstance(text4, str), f"cached seam returns str ({text4!r})")
 
 
+# ─── v9 M22: config override tests ──────────────────────────────────────────
+
+def test_v9_config_overrides():
+    """Verify that overriding HMNConfig params actually changes model behavior."""
+    print("\n[v9: config override effects]")
+
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asi = tok.token_to_id(ASSIST)
+
+    # Override tau_init -> should change gen logits (different gate steepness)
+    cfg0 = HMNConfig(dim=64, n_layers=2, vocab_size=tok.get_vocab_size(),
+                     asi_id=asi, ir_tau_init=12.0)
+    m0 = create_model(cfg0)
+    m0.eval()
+    ids = torch.tensor([[3, 4, 5, asi, 0]])
+
+    with torch.no_grad():
+        out0 = m0(ids)
+    logits0 = out0["gen_logits"].clone()
+
+    cfg1 = HMNConfig(dim=64, n_layers=2, vocab_size=tok.get_vocab_size(),
+                     asi_id=asi, ir_tau_init=2.0)
+    m1 = create_model(cfg1)
+    m1.eval()
+    with torch.no_grad():
+        out1 = m1(ids)
+    logits1 = out1["gen_logits"].clone()
+
+    # tau_init changes the gate steepness -> different blended logits output
+    different = not torch.allclose(logits0, logits1, atol=1e-5)
+    check(different, f"ir_tau_init override changed output")
+    print(f"  ok: ir_tau_init override changed gen_logits")
+
+    # Override ffn_mult -> should change parameter count
+    cfg3 = HMNConfig(dim=64, n_layers=2, vocab_size=tok.get_vocab_size(),
+                     variant="attention", ffn_mult=8.0)
+    m3 = create_model(cfg3)
+    p_default = sum(p.numel() for p in create_model(
+        HMNConfig(dim=64, n_layers=2, vocab_size=tok.get_vocab_size(),
+                  variant="attention")).parameters())
+    p_big = sum(p.numel() for p in m3.parameters())
+    check(p_big > p_default, f"ffn_mult=8.0 has more params ({p_big} > {p_default})")
+    print(f"  ok: ffn_mult=8.0 -> {p_big:,} params (default={p_default:,})")
+
+    # Override moe_key_dim -> should change MoE router param count
+    cfg4 = HMNConfig(dim=64, n_layers=2, vocab_size=tok.get_vocab_size(),
+                     variant="attention", use_moe=True, moe_key_dim=32)
+    m4 = create_model(cfg4)
+    cfg5 = HMNConfig(dim=64, n_layers=2, vocab_size=tok.get_vocab_size(),
+                     variant="attention", use_moe=True, moe_key_dim=16)
+    m5 = create_model(cfg5)
+    p4 = sum(p.numel() for p in m4.parameters())
+    p5 = sum(p.numel() for p in m5.parameters())
+    check(p4 != p5, f"moe_key_dim override changed params (32: {p4}, 16: {p5})")
+    print(f"  ok: moe_key_dim 32 vs 16 -> {p4:,} vs {p5:,}")
+
+    # gpu-xlarge preset
+    cfg6 = HMNConfig.from_preset("gpu-xlarge", vocab_size=tok.get_vocab_size(),
+                                  asi_id=asi)
+    check(cfg6.dim == 512, f"gpu-xlarge dim=512 (got {cfg6.dim})")
+    check(cfg6.n_layers == 6, f"gpu-xlarge n_layers=6 (got {cfg6.n_layers})")
+    m6 = create_model(cfg6)
+    n_params = sum(p.numel() for p in m6.parameters())
+    check(n_params > 1_000_000, f"gpu-xlarge has >1M params ({n_params:,})")
+    print(f"  ok: gpu-xlarge preset ({n_params:,} params)")
+
+    # TrainerConfig defaults
+    from hmn.trainer import TrainerConfig
+    tc = TrainerConfig()
+    check(tc.grad_clip == 5.0, f"grad_clip default=5.0 (got {tc.grad_clip})")
+    check(tc.lr == 3e-4, f"lr default=3e-4 (got {tc.lr})")
+    check(tc.optimizer == "adamw", f"optimizer default=adamw (got {tc.optimizer})")
+    print(f"  ok: TrainerConfig defaults correct")
+
+
+def test_v9_trainer_checkpoint():
+    """Verify Trainer save/load checkpoint roundtrip."""
+    print("\n[v9: trainer checkpoint]")
+    from hmn.trainer import Trainer, TrainerConfig
+
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asi = tok.token_to_id(ASSIST)
+    cfg = HMNConfig(dim=48, n_layers=2, vocab_size=tok.get_vocab_size(), asi_id=asi)
+    model = create_model(cfg)
+
+    trainer = Trainer(model, config=TrainerConfig(lr=1e-3))
+    # Simulate a few steps
+    model.train()
+    ids = torch.randint(0, tok.get_vocab_size() - 1, (2, 16))
+    for _ in range(5):
+        out = model(ids)
+        logits = out.get("logits", out.get("gen_logits"))
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, tok.get_vocab_size()), ids.reshape(-1))
+        loss.backward()
+        trainer.optimizer.step()
+        trainer.optimizer.zero_grad()
+        trainer.step += 1
+
+    # Save checkpoint
+    ckpt_path = "/tmp/test_v9_ckpt.pt"
+    trainer.save_checkpoint(ckpt_path, extra={"test_key": "test_value"})
+
+    # Load into new trainer
+    model2 = create_model(cfg)
+    trainer2 = Trainer(model2, config=TrainerConfig(lr=1e-3))
+    extra = trainer2.load_checkpoint(ckpt_path)
+
+    check(trainer2.step == trainer.step, f"step restored ({trainer2.step} == {trainer.step})")
+    check(extra.get("test_key") == "test_value", "extra data restored")
+
+    # Verify model weights match
+    for (n1, p1), (n2, p2) in zip(model.named_parameters(), model2.named_parameters()):
+        check(torch.allclose(p1, p2), f"param {n1} mismatch")
+
+    os.remove(ckpt_path)
+    print("  ok: save/load checkpoint roundtrip")
+    print("  ok: model weights match after restore")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_coupling_reversible()
@@ -813,4 +933,7 @@ if __name__ == "__main__":
     test_v8_decode_perm()
     test_v8_attn_seam_combo()
     test_v8_kv_cache()
+    # v9 tests
+    test_v9_config_overrides()
+    test_v9_trainer_checkpoint()
     print("\nALL TESTS PASSED")

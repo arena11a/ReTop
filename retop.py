@@ -270,7 +270,14 @@ def train(args, cfg):
 
     data = Dataset(args.data, tok, seq=cfg["seq"], val_frac=0.05, seed=args.seed)
     lossf = nn.CrossEntropyLoss(ignore_index=-100)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # v9 M22: configurable optimizer and weight decay
+    grad_clip = cfg.get("grad_clip", 5.0)
+    weight_decay = cfg.get("weight_decay", 0.0)
+    opt_name = cfg.get("optimizer", "adamw").lower()
+    if opt_name == "adam":
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
     rng = random.Random(args.seed)
 
     ev = args.eval_every or max(100, cfg["steps"] // 20)
@@ -292,7 +299,7 @@ def train(args, cfg):
         else:
             loss = lossf(out.reshape(-1, vocab), Y.reshape(-1))
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
         if step % ev == 0 or step == cfg["steps"]:
             vl, vt = 0.0, 0
