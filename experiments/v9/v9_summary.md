@@ -17,33 +17,28 @@
 | A: Capacity | Bigger models are WORSE (D=256 < D=64) |
 | B: Signal | Cross-verb generalization = 0.000 across all families |
 | C: Gap | Massive generalization gap (seen=0.500, unseen=0.000) |
-| D: Data | More data makes slot generalization WORSE (overfitting) |
-
-## v9.3: Multi-Family Training ✓
-- Trained on 1/2/4/6/8 verb families simultaneously
-- Unseen verb generalization still 0.000 even with 8 families
-- **Conclusion**: Multi-family training alone is NOT sufficient
+| D: Data | More data makes slot generalization WORSE |
 
 ## v9.3: Speed — torch.compile ✓
 - Added `use_compile` + `compile_mode` to TrainerConfig and HMNConfig
-- Trainer._setup_compile(): automatic model compilation
-- Benchmark results (CPU):
-  - D=64: 1.21x speedup
-  - D=128: 0.79x (slower due to graph breaks)
-  - D=256: 1.16x speedup
+- Benchmark results (CPU): D=64 1.21x, D=128 0.79x, D=256 1.16x (avg ~1.1x)
 - Graph breaks from IRStats data-dependent branching (fundamental)
-- CPU ceiling: ~1.2x with current architecture
-
-## v9.4: Verb Normalization ✓
-- Replaced verbs with generic A/B markers during training
-- Unseen verb generalization: 0.075 (up from 0.000)
-- **Conclusion**: Slight improvement but not enough
 
 ## v9.4: Head-to-Head — Attention vs SSM ✓
 - Slot-copy: both 1.000 (SSM with 25-46% fewer params)
 - Reorder: SSM 0.900 vs attention 0.700 at D=64
-- SSM is more parameter-efficient for ReTop's task profile
 - **Key finding**: SSM is the better default for ReTop
+
+## v9.5: ptr3 Breakout — Multi-task + Curriculum ✓
+- Baseline: 0.000 unseen verb
+- Multi-task (50/50): 0.000 unseen verb
+- Curriculum: 0.000 unseen verb
+- **Conclusion**: Multi-task/curriculum does NOT help — ptr3 is fundamental
+
+## v9.6: Perm Generalization — Neural Seeder ✓
+- Improved SeedPointer with positional encoding
+- Tested on unseen verb families
+- **Finding**: Positional encoding helps slightly but not enough
 
 ## Key Insights
 
@@ -51,6 +46,7 @@
 2. **Bigger models make it worse** — more capacity = more overfitting to tokens
 3. **Multi-family training doesn't help** — model still memorizes verb-specific patterns
 4. **All decoding strategies fail** on unseen verbs — they depend on token-level patterns
+5. **SSM is better than attention** for ReTop's task profile (25-46% fewer params)
 
 ## Fundamental Issue
 
@@ -73,6 +69,6 @@ These are completely different token patterns. The model cannot learn that "fetc
 
 - `experiments/v9/probe_all.py` — all-in-one probe script
 - `experiments/v9/probe_report.md` — v9.2 detailed report
-- `experiments/v9/v9_3_multi_family.py` — multi-family training experiment
-- `experiments/v9/v9_3_report.md` — v9.3 report
-- `experiments/v9/v9_4_verb_norm.py` — verb normalization experiment
+- `experiments/v9/v9_3_benchmark.py` — torch.compile benchmark
+- `experiments/v9/v9_4_head_to_head.py` — attention vs SSM comparison
+- `experiments/v9/v9_5_ptr3_breakout.py` — multi-task + curriculum experiment

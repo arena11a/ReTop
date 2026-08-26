@@ -191,6 +191,12 @@ Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
 - Reorder: SSM 0.900 vs attention 0.700 at D=64
 - **Key finding**: SSM is the better default for ReTop
 
+**v9.5 ✅ (ptr3 Breakout)**: multi-task + curriculum training:
+- Baseline: 0.000 unseen verb
+- Multi-task (50/50): 0.000 unseen verb
+- Curriculum: 0.000 unseen verb
+- **Conclusion**: ptr3 plateau is fundamental — requires architectural change
+
 **Key finding**: The ptr3 plateau is a training signal problem, not capacity/data. The model memorizes verb-specific token patterns instead of learning abstract swap structure. Custom tokenizer with verb-class tokens needed for v10+.
 
 ---
