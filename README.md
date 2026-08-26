@@ -173,6 +173,18 @@ Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
   - New preset: `gpu-xlarge` (D=512, L=6, ~5.5M params)
 - **Trainer class** (`hmn/trainer.py`): mixed precision (AMP), gradient accumulation, LR schedule (constant/cosine/linear + warmup), checkpoint resume, early stopping
 
+**v9.2 ✅ (failure probes)**: ptr3 plateau root cause identified:
+- **Probe A**: Bigger models are WORSE (D=256 < D=64) — overfitting to tokens
+- **Probe B**: Cross-verb generalization = 0.000 — model memorizes verb tokens
+- **Probe C**: Massive generalization gap (seen=0.500, unseen=0.000)
+- **Probe D**: More data makes slot generalization WORSE
+
+**v9.3 ✅ (multi-family training)**: trained on 1/2/4/6/8 verb families — unseen verb generalization still 0.000
+
+**v9.4 ✅ (verb normalization)**: replaced verbs with generic markers — slight improvement (0.075) but insufficient
+
+**Key finding**: The ptr3 plateau is a training signal problem, not capacity/data. The model memorizes verb-specific token patterns instead of learning abstract swap structure. Custom tokenizer with verb-class tokens needed for v10+.
+
 ---
 
 ## Quickstart — running in ~8 minutes
@@ -399,6 +411,11 @@ retop_tokenizer.json        the tokenizer (vocab 3190)
   task family doesn't generalize across families. The attention pointer (M17)
   and rich fingerprint (M16) address this architecturally, but data diversity
   (new task families) is still needed for full breakout.
+- **v9 finding**: ptr3 plateau is a training signal problem, NOT capacity/data.
+  Bigger models make it worse (overfitting). Multi-family training and verb
+  normalization don't help enough. Root cause: model memorizes verb-specific
+  token patterns instead of learning abstract swap structure. Custom tokenizer
+  with verb-class tokens needed for v10+.
 
 ### Reproducibility
 
