@@ -178,10 +178,13 @@ Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
 - **Probe B**: Cross-verb generalization = 0.000 — model memorizes verb tokens
 - **Probe C**: Massive generalization gap (seen=0.500, unseen=0.000)
 - **Probe D**: More data makes slot generalization WORSE
+- **v9.2b**: Multi-family training — insufficient alone (0.000 unseen verb)
+- **v9.2c**: Verb normalization — slight improvement (0.075) but not enough
 
-**v9.3 ✅ (multi-family training)**: trained on 1/2/4/6/8 verb families — unseen verb generalization still 0.000
-
-**v9.4 ✅ (verb normalization)**: replaced verbs with generic markers — slight improvement (0.075) but insufficient
+**v9.3 ✅ (torch.compile)**: speed optimization for CPU:
+- `use_compile` + `compile_mode` in TrainerConfig and HMNConfig
+- Benchmark: D=64 1.21x, D=128 0.79x, D=256 1.16x (avg ~1.1x)
+- Graph breaks from IRStats data-dependent branching (fundamental limit)
 
 **Key finding**: The ptr3 plateau is a training signal problem, not capacity/data. The model memorizes verb-specific token patterns instead of learning abstract swap structure. Custom tokenizer with verb-class tokens needed for v10+.
 

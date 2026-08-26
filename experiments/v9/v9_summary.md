@@ -24,6 +24,16 @@
 - Unseen verb generalization still 0.000 even with 8 families
 - **Conclusion**: Multi-family training alone is NOT sufficient
 
+## v9.3: Speed — torch.compile ✓
+- Added `use_compile` + `compile_mode` to TrainerConfig and HMNConfig
+- Trainer._setup_compile(): automatic model compilation
+- Benchmark results (CPU):
+  - D=64: 1.21x speedup
+  - D=128: 0.79x (slower due to graph breaks)
+  - D=256: 1.16x speedup
+- Graph breaks from IRStats data-dependent branching (fundamental)
+- CPU ceiling: ~1.2x with current architecture
+
 ## v9.4: Verb Normalization ✓
 - Replaced verbs with generic A/B markers during training
 - Unseen verb generalization: 0.075 (up from 0.000)
