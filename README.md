@@ -136,14 +136,16 @@ gate + teacher-forced evidence), slot-invariant fingerprint retrieval,
 ambiguity escalation, open-world fallback; 10/10 execution on every family
 (`experiments/v5/m4_skills.py`).
 Details + open items: [`docs/v5_omega_roadmap.md`](docs/v5_omega_roadmap.md).
-**v6 (active, branch `v6`)**: scale to a community-trainable foundation
-architecture — IR-as-inverted-index, HF packaging, BF16, distributed training.
-M1-A shipped: register gate stats (`mass_same`/`n_legal`) derived from a token
-index instead of a second `(B,T,T)` tensor — 153× faster at T=4096. M1-B
-shipped: the default forward is index-native (`IRStats`) — no `(B,T,T)`/`(B,T,V)`
-register tensors, blend CE via exact logaddexp, decode via payload MODE table;
-3.7× less forward memory @T=2048, all guardrails unchanged. Roadmap:
-[`docs/v6_scaling_roadmap.md`](docs/v6_scaling_roadmap.md).
+**v6 ✅ (branch `v6`)**: community-trainable foundation architecture — all
+milestones shipped:
+- **M1**: IR-as-inverted-index — 153× faster stats @T=4096, no `(B,T,T)`/`(B,T,V)` register tensors
+- **M2**: HF packaging — `HMNForCausalLM` with `save_pretrained`/`from_pretrained`, Trainer 100-step smoke (loss 2.22→0.006)
+- **M3**: Precision ladder — fp32-island audit, NaN sweep 5 seeds, mixed-precision backward verified
+- **M4**: Scale specs — cpu-small/gpu-small/gpu-medium/gpu-large presets, D=256 1k-step smoke
+- **M5**: Packed sequence — doc-masked padding, position_ids, ReversibleFunction compat
+- **M6**: Streaming data — StreamJsonlReader, BoundedBufferShuffle, InfiniteStreamDataset
+- **M7**: Triton design notes + torch.compile probe (CPU break-even–1.26×)
+Roadmap: [`docs/v6_scaling_roadmap.md`](docs/v6_scaling_roadmap.md).
 
 ---
 
