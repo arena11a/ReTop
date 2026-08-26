@@ -40,6 +40,9 @@ class TrainerConfig:
     # Mixed precision
     use_amp: bool = False
     amp_dtype: str = "bf16"  # "bf16" or "fp16"
+    # torch.compile
+    use_compile: bool = False  # enable torch.compile for speedup
+    compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
     # Early stopping
     patience: int = 0  # 0 = disabled
     # Checkpointing
@@ -94,6 +97,11 @@ class Trainer:
         self.patience_counter = 0
         self._tb_writer = None
 
+        # torch.compile
+        self._compiled = False
+        if self.cfg.use_compile:
+            self._setup_compile()
+
     def _setup_optimizer(self):
         """Create optimizer based on config."""
         params = self.model.parameters()
@@ -103,6 +111,21 @@ class Trainer:
             self.optimizer = torch.optim.Adam(params, lr=lr, weight_decay=wd)
         else:
             self.optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+
+    def _setup_compile(self):
+        """Compile model with torch.compile for speedup."""
+        if not self.cfg.use_compile:
+            return
+        try:
+            self.model = torch.compile(
+                self.model,
+                mode=self.cfg.compile_mode,
+            )
+            self._compiled = True
+            self._log(f"torch.compile enabled (mode={self.cfg.compile_mode})")
+        except Exception as e:
+            self._log(f"torch.compile failed: {e}, falling back to eager")
+            self._compiled = False
 
     def _setup_scheduler(self, total_steps):
         """Create LR schedule."""

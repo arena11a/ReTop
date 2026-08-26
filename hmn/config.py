@@ -89,6 +89,9 @@ class HMNConfig:
     grad_clip: float = 5.0
     weight_decay: float = 0.0
     optimizer: str = "adamw"
+    # v9 M23: torch.compile
+    use_compile: bool = False
+    compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
 
     # --- presets ---
 
