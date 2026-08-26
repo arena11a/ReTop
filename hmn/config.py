@@ -66,6 +66,8 @@ class HMNConfig:
     max_seq_len: int = 8192
     use_checkpoint: bool = True
     dropout: float = 0.0
+    # v8 M20: attention-based seed pointer (when seam_addr=True)
+    attn_ptr: bool = False
 
     # --- presets ---
 
@@ -77,6 +79,11 @@ class HMNConfig:
         "attn-small": {"dim": 64, "n_layers": 2, "variant": "attention"},
         "attn-medium": {"dim": 128, "n_layers": 3, "variant": "attention"},
         "attn-large": {"dim": 256, "n_layers": 4, "variant": "attention"},
+        # v8 M20: attention-WR + seam_addr + attention pointer
+        "attn-seam-small": {"dim": 64, "n_layers": 2, "variant": "attention",
+                            "seam_addr": True, "stem_addr": True, "attn_ptr": True},
+        "attn-seam-medium": {"dim": 128, "n_layers": 3, "variant": "attention",
+                             "seam_addr": True, "stem_addr": True, "attn_ptr": True},
     }
 
     @classmethod
@@ -151,6 +158,7 @@ def create_model(config, asi_id=None, user_id=None, **overrides):
         "seam_addr": config.seam_addr,
         "max_run": config.max_run,
         "exact_blend": config.exact_blend,
+        "attn_ptr": config.attn_ptr,
     }
     for k, v in overrides.items():
         cfg_dict[k] = v
@@ -174,6 +182,7 @@ def create_model(config, asi_id=None, user_id=None, **overrides):
             max_seq_len=config.max_seq_len,
             use_checkpoint=config.use_checkpoint,
             dropout=config.dropout,
+            attn_ptr=cfg_dict["attn_ptr"],
         )
     else:
         return HMN3(**cfg_dict)

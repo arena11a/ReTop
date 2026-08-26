@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from hmn.v3 import IdentityRegister, DualHeadDecoder, SeedPointer
+from hmn.v3 import IdentityRegister, DualHeadDecoder, SeedPointer, AttentionSeedPointer
 
 
 class SparseConditionalComputeV2(nn.Module):
@@ -203,7 +203,7 @@ class AttentionBlock(nn.Module):
         self.ln2 = RMSNorm(dim)
         self.ffn = SwiGLUFFN(dim, dropout=dropout)
 
-    def forward(self, x, offset=0):
+    def forward(self, x, offset=0, kv_cache=None):
         B, T, D = x.shape
 
         # Attention with Pre-LN
@@ -215,11 +215,23 @@ class AttentionBlock(nn.Module):
         # Apply RoPE
         q, k = self.rope(q, k, offset=offset)
 
-        # Scaled dot-product attention (causal mask)
+        # KV cache: concatenate with cached keys/values
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            k = torch.cat([cached_k, k], dim=2)   # (B, nh, seq+T, hd)
+            v = torch.cat([cached_v, v], dim=2)
+        new_cache = (k, v)
+
+        # Scaled dot-product attention
         scale = self.head_dim ** -0.5
         attn = (q @ k.transpose(-2, -1)) * scale
-        causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        attn = attn.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        # causal mask: q positions (offset..offset+T) vs k positions (0..offset+T)
+        S = k.shape[2]
+        causal_mask = torch.triu(
+            torch.ones(T, S, device=x.device, dtype=torch.bool),
+            diagonal=S - T + 1)
+        attn = attn.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0),
+                                float("-inf"))
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
 
@@ -231,7 +243,7 @@ class AttentionBlock(nn.Module):
         # FFN with Pre-LN
         x = x + self.ffn(self.ln2(x))
 
-        return x
+        return x, new_cache
 
 
 class HMN3AttentionWR(nn.Module):
@@ -251,7 +263,8 @@ class HMN3AttentionWR(nn.Module):
                  n_experts=16, top_k=2, use_moe=False, tie_weights=True,
                  gate_bias=0.0, asi_id=None, user_id=None,
                  stem_addr=False, seam_addr=False, max_run=16,
-                 max_seq_len=8192, use_checkpoint=True, dropout=0.0):
+                 max_seq_len=8192, use_checkpoint=True, dropout=0.0,
+                 attn_ptr=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -282,7 +295,11 @@ class HMN3AttentionWR(nn.Module):
                                     tie_embed=self.embed.weight if tie_weights else None,
                                     gate_bias=gate_bias)
         self.seam_addr = seam_addr
-        self.seed_ptr = SeedPointer(dim, max_run=max_run) if seam_addr else None
+        # v8 M20: attention-based seed pointer when attn_ptr=True
+        self.seed_ptr = (AttentionSeedPointer(dim, max_run=max_run)
+                         if seam_addr and attn_ptr
+                         else SeedPointer(dim, max_run=max_run) if seam_addr
+                         else None)
         self.sparse_marginal = False
         self.aux_copy = False
         self.exact_blend = False
@@ -292,32 +309,42 @@ class HMN3AttentionWR(nn.Module):
             return torch.tensor(0.0)
         return sum(m.last_aux_loss * m.aux_coef for m in self.moe_list if m is not None)
 
-    def blocks_apply(self, x):
-        """Apply attention blocks with optional gradient checkpointing."""
+    def blocks_apply(self, x, kv_cache=None, offset=0):
+        """Apply attention blocks with optional gradient checkpointing and KV cache.
+
+        Returns (output, new_kv_cache) where new_kv_cache is None if kv_cache is None.
+        """
+        new_caches = []
         for i, blk in enumerate(self.blocks):
+            layer_cache = kv_cache[i] if kv_cache is not None else None
             if self.use_checkpoint and self.training:
-                h = grad_checkpoint(blk, x, use_reentrant=False)
+                h, nc = grad_checkpoint(blk, x, offset=offset,
+                                        kv_cache=layer_cache,
+                                        use_reentrant=False)
             else:
-                h = blk(x)
+                h, nc = blk(x, offset=offset, kv_cache=layer_cache)
             if self.moe_list[i] is not None:
                 h = h + self.moe_list[i](h)
             x = h
-        return x
+            new_caches.append(nc)
+        return x, new_caches if kv_cache is not None else None
 
     def forward(self, input_ids, return_gate=False, return_attn=False,
-                seam_anchor=None, exact_blend=None):
+                seam_anchor=None, exact_blend=None, kv_cache=None,
+                kv_offset=0):
         ids = input_ids
         x = self.embed(ids)
 
-        # Attention-WR (NOT reversible — gradient checkpointing)
-        h = self.blocks_apply(x)
+        # Attention-WR with optional KV cache
+        h, new_cache = self.blocks_apply(x, kv_cache=kv_cache, offset=kv_offset)
 
         # IR + DualHeadDecoder (same as HMN3)
         st = self.ir.stats(x, ids, seam_anchor=seam_anchor)
         gen_logits, g = self.dual.gate_and_gen(h, st.mass_same, st.behind,
                                                n_legal=st.n_legal)
         d = {"gen_logits": gen_logits, "g": g, "stats": st,
-             "n_legal": st.n_legal}
+             "n_legal": st.n_legal, "kv_cache": new_cache,
+             "kv_offset": kv_offset + ids.shape[1]}
 
         if self.seed_ptr is not None:
             B, T = ids.shape
@@ -331,3 +358,27 @@ class HMN3AttentionWR(nn.Module):
             d["len_logits"] = len_logits
 
         return d
+
+    def decode_step(self, new_id, kv_cache, kv_offset, full_x, full_ids,
+                    seam_anchor=None):
+        """Single-token decode with KV cache.
+
+        new_id: (B, 1) token id
+        kv_cache: list of (K, V) tuples from previous step
+        kv_offset: number of tokens already in the cache
+        full_x: (B, seq_len, dim) full embedding matrix (for IR)
+        full_ids: (B, seq_len) full token ids (for IR)
+
+        Returns output dict with gen_logits, g, stats, kv_cache, kv_offset.
+        """
+        dev = new_id.device
+        x_new = self.embed(new_id)                     # (B, 1, D)
+        h, new_cache = self.blocks_apply(x_new, kv_cache=kv_cache,
+                                         offset=kv_offset)
+        # IR needs full embeddings for addressing
+        st = self.ir.stats(full_x, full_ids, seam_anchor=seam_anchor)
+        gen_logits, g = self.dual.gate_and_gen(h, st.mass_same, st.behind,
+                                               n_legal=st.n_legal)
+        return {"gen_logits": gen_logits, "g": g, "stats": st,
+                "n_legal": st.n_legal, "kv_cache": new_cache,
+                "kv_offset": kv_offset + 1}

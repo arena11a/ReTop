@@ -27,6 +27,7 @@ from hmn.v2 import (
     SparseConditionalCompute,
 )
 from hmn.v3 import (
+    AttentionSeedPointer,
     DualHeadDecoder,
     HMN3,
     HMN3_NoReg,
@@ -54,6 +55,7 @@ __all__ = [
     "SelectiveSSM",
     "SparseConditionalCompute",
     # v3 dual-register decoder
+    "AttentionSeedPointer",
     "DualHeadDecoder",
     "HMN3",
     "HMN3_NoReg",
@@ -84,4 +86,4 @@ __all__ = [
     "load_compat",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.3"

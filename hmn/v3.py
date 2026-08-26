@@ -169,54 +169,43 @@ class IdentityRegister(nn.Module):
                 # OFF (v3.3 unchanged).
                 u = (ids == self.user_id).float().argmax(-1)                # (B,) USER col
                 r = bound                                              # (B,) ASI row
-                a = a.clone()
-                for b in range(B):
-                    ub, ab = u[b].item(), r[b].item()
-                    # v5 omega-seam: explicit seam_anchor rows override the
-                    # echo mapping, so skip stem-addr entirely when an anchor
-                    # tensor is present — otherwise it would fire on REORDER
-                    # sequences too (joint M2) and corrupt their non-echo rows.
-                    if seam_anchor is not None:
-                        break
-                    for t in range(ab, T):
-                        # gold[i] == user token at col u+i (user text == gold in
-                        # the echo task); copy payload of column j is ids[j+1],
-                        # so gold[i] is copied by anchoring row a+i to col u+i.
-                        c = ub + (t - ab)
-                        if c + 1 >= ab:                # col u+i's payload would
-                            break                      # reach ASI -> EOS row; leave
-                        a[b, t, :] = 0.0               # identity fallback (closes gate)
-                        a[b, t, c] = 1.0
-                        behind[b, t] = False           # copyable row now
-                        mass_same[b, t] = 1.0          # gate opens there
+                if seam_anchor is None:
+                    a = a.clone()
+                    pos_stem = torch.arange(T, device=ids.device)
+                    # valid rows: r <= t and u + (t - r) + 1 < r  =>  t < 2r - u - 1
+                    upper = (2 * r - u - 1).clamp(max=T)
+                    row_valid = ((pos_stem.unsqueeze(0) >= r.unsqueeze(1))
+                                 & (pos_stem.unsqueeze(0) < upper.unsqueeze(1)))
+                    # column index per valid row
+                    col = u.unsqueeze(1) + (pos_stem.unsqueeze(0) - r.unsqueeze(1))
+                    one_hot = torch.zeros(B, T, T, dtype=a.dtype, device=a.device)
+                    one_hot.scatter_(2, col.unsqueeze(-1).clamp(min=0),
+                                    row_valid.unsqueeze(-1).float())
+                    a = torch.where(row_valid.unsqueeze(-1), one_hot, a)
+                    behind.masked_fill_(row_valid, False)
+                    mass_same.masked_fill_(row_valid, 1.0)
         if seam_anchor is not None:
             a = a.clone()
-            for b in range(B):
-                for t in range(T):
-                    c = int(seam_anchor[b, t].item())
-                    if c >= 0:
-                        a[b, t, :] = 0.0
-                        a[b, t, c] = 1.0
-                        behind[b, t] = False
-                        mass_same[b, t] = 1.0
+            forced_mask = seam_anchor >= 0                    # (B, T) bool
+            one_hot = torch.zeros(B, T, T, dtype=a.dtype, device=a.device)
+            safe_col = seam_anchor.clamp(min=0)
+            one_hot.scatter_(2, safe_col.unsqueeze(-1),
+                             forced_mask.unsqueeze(-1).float())
+            a = torch.where(forced_mask.unsqueeze(-1), one_hot, a)
+            behind.masked_fill_(forced_mask, False)
+            mass_same.masked_fill_(forced_mask, 1.0)
         return a, nxt, n_legal, ctx, behind, mass_same, mask
 
     def _forced_columns(self, ids, seam_anchor=None):
         """Anchor overrides as a (B,T) column tensor (-100 = free row).
 
-        Replicates the stem-addr / omega-seam loops of _attn EXACTLY (same
-        guards, same iteration order): seam anchors take precedence and skip
-        stem-addr entirely; stem echo runs from the ASI row while its payload
-        stays inside the prompt region.
+        Vectorized version — no Python loops. Same contract as before:
+        seam anchors take precedence; stem echo runs from the ASI row.
         """
         B, T = ids.shape
         forced = torch.full((B, T), -100, dtype=torch.long, device=ids.device)
         if seam_anchor is not None:
-            for b in range(B):
-                for t in range(T):
-                    c = int(seam_anchor[b, t].item())
-                    if c >= 0:
-                        forced[b, t] = c
+            forced = torch.where(seam_anchor >= 0, seam_anchor, forced)
             return forced
         if (self.stem_addr and self.user_id is not None
                 and self.asi_id is not None
@@ -226,13 +215,13 @@ class IdentityRegister(nn.Module):
             idx = (ids == self.asi_id).float().argmax(-1)         # (B,) ASI row
             have = (ids == self.asi_id).any(-1)
             r = torch.where(have, idx, torch.full_like(idx, T)).long()
-            for b in range(B):
-                ub, ab = u[b].item(), r[b].item()
-                for t in range(ab, T):
-                    c = ub + (t - ab)
-                    if c + 1 >= ab:
-                        break
-                    forced[b, t] = c
+            pos_fc = torch.arange(T, device=ids.device)
+            # valid rows: r <= t and u + (t - r) + 1 < r  =>  t < 2r - u - 1
+            upper = (2 * r - u - 1).clamp(max=T)
+            row_valid = ((pos_fc.unsqueeze(0) >= r.unsqueeze(1))
+                         & (pos_fc.unsqueeze(0) < upper.unsqueeze(1)))
+            col = u.unsqueeze(1) + (pos_fc.unsqueeze(0) - r.unsqueeze(1))
+            forced = torch.where(row_valid, col.clamp(min=0), forced)
         return forced
 
     def stats(self, keys, ids, seam_anchor=None):
@@ -677,6 +666,56 @@ class SeedPointer(nn.Module):
         return logits, len_logits
 
 
+class AttentionSeedPointer(nn.Module):
+    """v8 M17: multi-head cross-attention seed pointer.
+
+    Replaces v5's cosine-similarity pointer with full multi-head attention:
+      1. h (last hidden) as query, x (raw embeddings) as key/value
+      2. Output is contextualized per-column representation
+      3. Attention weights become the pointer logits (softmax-normalized
+         distribution over prompt columns, scaled by learnable temperature)
+
+    Advantage: the pointer can attend to positional structure and context
+    jointly, not just raw embedding similarity.  The length head is unchanged.
+
+    Default OFF; HMN3(seam_addr=True, attn_ptr=True) instantiates it.
+    """
+
+    def __init__(self, dim, max_run=16, n_heads=4, dropout=0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.len_head = nn.Linear(dim, max_run)
+        self.max_run = max_run
+        # learnable temperature for pointer logits (initialized ~beta=20)
+        self.ptr_temp = nn.Parameter(torch.tensor(3.0))
+
+    def forward(self, h, keys, bound):
+        B, T, D = h.shape
+        nh, hd = self.n_heads, self.head_dim
+        q = self.q_proj(h.float()).view(B, T, nh, hd).transpose(1, 2)
+        k = self.k_proj(keys.float()).view(B, T, nh, hd).transpose(1, 2)
+        v = self.v_proj(keys.float()).view(B, T, nh, hd).transpose(1, 2)
+        attn = (q @ k.transpose(-1, -2)) * self.scale          # (B,nh,T,T)
+        cols = torch.arange(T, device=h.device)
+        legal = cols.unsqueeze(0) < bound.unsqueeze(-1)         # (B,T)
+        attn = attn.masked_fill(~legal.unsqueeze(1).unsqueeze(2), float("-inf"))
+        attn_w = F.softmax(attn, dim=-1)
+        attn_w = self.dropout(attn_w)
+        out = (attn_w @ v).transpose(1, 2).contiguous().view(B, T, D)
+        out = self.out_proj(out)
+        # pointer logits: average attention across heads, scaled by temperature
+        ptr_logits = attn_w.mean(dim=1) * self.ptr_temp.exp()  # (B,T,T)
+        len_logits = self.len_head(h.float())
+        return ptr_logits, len_logits
+
+
 class LatentThinkingBuffer(nn.Module):
     """Adaptive deliberation: re-run the WR block sequence over the last hidden
     state, refining it in latent space without decoding to text tokens. Stops
@@ -724,7 +763,7 @@ class HMN3(nn.Module):
                  gate_bias=0.0, aux_copy=True, asi_id=None,
                  sparse_marginal=False, gate_mode="deterministic", user_id=None,
                  stem_addr=False, seam_addr=False, max_run=16,
-                 exact_blend=False):
+                 exact_blend=False, attn_ptr=False):
         super().__init__()
         # v6 M1-B: False (default) = index/stats path (no (B,T,T)/(B,T,V));
         # True = legacy dense oracle (bit-faithful pre-M1 behavior) for parity
@@ -755,7 +794,11 @@ class HMN3(nn.Module):
         # v5 omega-seam: fragment-run seeding (reorder/transform tasks).
         # Default OFF -> parameter set identical to v3.3/v4 checkpoints.
         self.seam_addr = seam_addr
-        self.seed_ptr = SeedPointer(dim, max_run=max_run) if seam_addr else None
+        # v8 M17: attention-based seed pointer (attn_ptr=True) or cosine (default)
+        self.seed_ptr = (AttentionSeedPointer(dim, max_run=max_run)
+                         if seam_addr and attn_ptr
+                         else SeedPointer(dim, max_run=max_run) if seam_addr
+                         else None)
 
     def moe_aux_loss(self):
         if not self.use_moe:

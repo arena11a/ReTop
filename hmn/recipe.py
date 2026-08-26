@@ -650,6 +650,86 @@ def decode_rotate(model, tok, prompt_ids, max_new=48, device=None):
         sum(gates) / len(gates) if gates else 0.0), seeded
 
 
+def decode_perm(model, tok, prompt_ids, max_new=48, device=None):
+    """v8 M18: arbitrary-permutation decoder — re-seeds at every seam.
+
+    Generalizes decode_rotate: instead of a fixed cyclic order, uses the
+    SeedPointer at EVERY seam boundary to pick the next segment.  The pointer
+    sees the full current context (all emitted segments so far) and proposes
+    the next column; the decoder converts that to a segment index.
+
+    Duplicate-segment avoidance: once a segment has been emitted, its columns
+    are masked to -inf in ptr_logits so the pointer cannot re-select it.
+    All segments emitted -> EOS.
+
+    Returns (text, gate_avg, n_seeded).
+    """
+    ids = list(prompt_ids)
+    eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
+    asi_pos = ids.index(asid)
+    U = ids[2:asi_pos]
+    ands = _find_all_word(tok, U, REORDER_AND)
+    if not ands:
+        raise AssertionError("decode_perm: no separator in prompt")
+    n_parts = len(ands) + 1
+    bounds = [-1] + ands + [len(U)]
+    ans_len = max(0, len(prompt_ids) - 3)
+    gates = []
+    seeded = 0
+    emitted = set()           # segment indices already emitted
+    run_left = 0
+    cur = None                # (anchor_base, run_start_t)
+    with torch.no_grad():
+        while len(ids) - len(prompt_ids) < max_new:
+            t_idx = len(ids) - len(prompt_ids)
+            if pos_eos_done(t_idx, ans_len):
+                break
+            inp = torch.tensor([ids], device=device)
+            if run_left > 0:
+                # continue current run via positional echo
+                c = cur[0] + (t_idx - cur[1])
+                anch = torch.full((1, inp.shape[1]), -100,
+                                  dtype=torch.long, device=device)
+                anch[0, -1] = c
+                out = model(inp, seam_anchor=anch)
+                nxt = ids[c + 1]
+                run_left -= 1
+            else:
+                # seam boundary: run model to get pointer
+                out = model(inp)
+                if len(emitted) >= n_parts:
+                    break
+                # mask out already-emitted segments in ptr_logits
+                pl = out["ptr_logits"][0, -1].clone()     # (T,)
+                for seg_i in emitted:
+                    lo = bounds[seg_i] + 2
+                    hi = bounds[seg_i + 1] + 1
+                    if lo < hi:
+                        pl[lo:hi] = float("-inf")
+                # pick the highest-scoring legal column
+                c0 = int(pl.argmax(-1).item())
+                # map column -> segment index
+                seg = next((kk for kk in range(n_parts)
+                            if bounds[kk] + 1 <= c0 <= bounds[kk + 1]), None)
+                if seg is None:
+                    # fallback: pick first unemitted segment
+                    seg = next(s for s in range(n_parts) if s not in emitted)
+                emitted.add(seg)
+                cur_c = bounds[seg] + 2
+                L = bounds[seg + 1] - bounds[seg] - 1
+                nxt = ids[cur_c + 1]
+                cur = (cur_c, t_idx)
+                run_left = L - 1
+                seeded += 1
+            gates.append(float(out["g"][0, -1]))
+            if nxt in (eos, asid):
+                break
+            ids.append(nxt)
+    return tok.decode(ids[len(prompt_ids):]).strip(), (
+        sum(gates) / len(gates) if gates else 0.0), seeded
+
+
 def pos_eos_done(t_idx, ans_len):
     return ans_len is not None and t_idx >= ans_len
 
@@ -673,6 +753,34 @@ def eval_reorders(model, tok, a_slots, b_slots, seed=0, mode="hard",
         gold_text = tok.decode(ids[asi_pos + 1:-1]).strip()
         out, g, _ng = decode_v33(model, tok, prompt, max_new=max_new,
                                  mode=mode, seam=True, pos_eos=pos_eos,
+                                 device=device)
+        tot += 1
+        ok += int(out.strip() == gold_text)
+        gates.append(g)
+    model.train()
+    return ok / tot, (sum(gates) / len(gates) if gates else 0.0)
+
+
+def eval_perms(model, tok, a_slots, b_slots, seed=0, max_new=48,
+               pos_eos=True, device=None):
+    """v8 M18: exact-match on the PERMUTATION task (via decode_perm).
+
+    Tests whether the model can decode an arbitrary permutation of the
+    prompt's segments.  Gold text is the canonical re-ordered text matching
+    the permutation implied by the prompt structure (reorder = swap a/b).
+    Returns (accuracy, avg_gate)."""
+    model.eval()
+    rng = random.Random(seed)
+    ok = tot = 0
+    gates = []
+    for _ in a_slots:
+        a = rng.choice(a_slots)
+        b = rng.choice(b_slots)
+        ids, asi_pos, _ = make_reorder_ids(tok, a, b)
+        prompt = ids[:asi_pos + 1]
+        gold_text = tok.decode(ids[asi_pos + 1:-1]).strip()
+        out, g, _ng = decode_v33(model, tok, prompt, max_new=max_new,
+                                 mode="hard", seam=True, pos_eos=pos_eos,
                                  device=device)
         tot += 1
         ok += int(out.strip() == gold_text)
@@ -845,7 +953,7 @@ def loss_v33(out, Y, Yc, G, lossf=None, w_copy=1.0, w_gate=0.0):
 
 def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
                boundary_eos=False, device=None, cycle_break=False, pos_eos=False,
-               seam=False):
+               seam=False, use_kv_cache=False):
     """Greedy decode. mode:
       blend  -> argmax of (1-g)*gen + g*copy
       hard   -> if g > gate_thr: argmax(copy_dist) else argmax(blend)
@@ -886,21 +994,101 @@ def decode_v33(model, tok, prompt_ids, max_new=16, mode="blend", gate_thr=0.5,
     the next run: c_new = argmax ptr_logits, L_new = argmax len_logits + 1.
     Termination via pos_eos (a pure permutation keeps |answer| == |user|) or
     an ASI/EOS payload guard. Requires HMN3(seam_addr=True).
+
+    use_kv_cache: KV-cache accelerated decode for attention-WR models.
     """
     ids = list(prompt_ids)
     eos = tok.token_to_id(EOS)
     asid = tok.token_to_id(ASSIST)
     gates, n_gen = [], 0
     seen_pairs = set()
-    # v4 M6: expected answer length = user content tokens, known a priori for
-    # echo tasks (user == gold). Weaker than it looks: if a future non-echo
-    # task needs it, the model must learn to emit EOS itself (pos_eos OFF).
     ans_len = max(0, len(prompt_ids) - 3) if pos_eos else None
     run_base = run_start = None
     run_left = 0
+    # KV cache state
+    kv_cache = None
+    kv_offset = 0
+    cached_emb = None          # full embedding matrix for IR
+    has_kv = (use_kv_cache and hasattr(model, "decode_step")
+              and hasattr(model, "embed"))
     with torch.no_grad():
         for _ in range(max_new):
             t_idx = len(ids) - len(prompt_ids)          # answer row (0-based)
+            if has_kv and kv_cache is not None:
+                # cached decode: only embed the new token
+                new_id = torch.tensor([[ids[-1]]], device=device) if len(ids) > len(prompt_ids) + 1 else None
+                if new_id is None:
+                    # first step: full prefill
+                    inp = torch.tensor([ids], device=device)
+                    out = model(inp)
+                    kv_cache = out.get("kv_cache")
+                    kv_offset = out.get("kv_offset", len(ids))
+                    cached_emb = model.embed(inp)       # (B, T, D) full embeddings
+                else:
+                    # incremental decode
+                    new_emb = model.embed(new_id)       # (B, 1, D)
+                    cached_emb = torch.cat([cached_emb, new_emb], dim=1)
+                    out = model.decode_step(new_id, kv_cache, kv_offset,
+                                            cached_emb,
+                                            torch.tensor([ids], device=device))
+                    kv_cache = out.get("kv_cache")
+                    kv_offset = out.get("kv_offset", kv_offset + 1)
+                if seam:
+                    if run_left > 0:
+                        c = run_base + (t_idx - run_start)
+                        nxt = ids[c + 1]
+                        run_left -= 1
+                    else:
+                        c_new = int(out["ptr_logits"][0, -1].argmax(-1).item())
+                        l_new = int(out["len_logits"][0, -1].argmax(-1).item()) + 1
+                        nxt = ids[c_new + 1]
+                        run_base, run_start, run_left = c_new, t_idx, l_new - 1
+                    gates.append(float(out["g"][0, -1]))
+                    if pos_eos and t_idx >= ans_len:
+                        break
+                    if nxt in (eos, asid):
+                        break
+                    ids.append(nxt)
+                    continue
+                g = out["g"][0, -1].item()
+                gates.append(g)
+                if "stats" in out:
+                    st = out["stats"]
+                    gl = out["gen_logits"][0, -1]
+                    mv = int(st.copy_mode[0, -1])
+                    cand_copy = mv if mv >= 0 else int(gl.argmax())
+                    pay, fr = st.payloads_of(0, len(ids) - 1)
+                    blend_arg = blend_argmax(gl, g, pay, fr)
+                else:
+                    logits = out["logits"]
+                    cand_copy = int(logits[0, -1].argmax(-1).item())
+                    blend_arg = None
+                pair = None
+                if len(ids) > len(prompt_ids) + 1:
+                    prev = ids[-1]
+                    if prev != cand_copy:
+                        pair = (prev, cand_copy)
+                if pos_eos and len(ids) - len(prompt_ids) >= ans_len:
+                    nxt = eos
+                elif cycle_break and pair is not None and pair in seen_pairs:
+                    nxt = eos
+                elif boundary_eos and len(ids) > len(prompt_ids) and g < gate_thr:
+                    nxt = eos
+                elif mode == "copy":
+                    nxt = cand_copy
+                elif mode == "hard" and g > gate_thr:
+                    nxt = cand_copy
+                else:
+                    n_gen += 1
+                    nxt = blend_arg if blend_arg is not None \
+                        else int(gl.argmax().item())
+                if pair is not None:
+                    seen_pairs.add(pair)
+                if nxt == eos:
+                    break
+                ids.append(nxt)
+                continue
+            # ---- non-cached path (original) ----
             inp = torch.tensor([ids], device=device)
             if seam:
                 if run_left > 0:
@@ -1094,6 +1282,88 @@ def train(model, tok, slots=None, n_steps=200, bs=1, lr=3e-4,
             history["steps"].append(step)
             print(f"step {step:5d} loss={loss.item():.4f} "
                   f"eval={acc:.3f} gate={gate:.3f}")
+            model.train()
+
+    return history
+
+
+def train_multitask(model, tok, n_steps=200, bs=1, lr=3e-4,
+                    seed=42, eval_every=50, device=None, w_copy=1.0,
+                    slot_weight=0.5, seam_weight=0.5,
+                    n_train_slots=40, n_eval_slots=20,
+                    callback=None):
+    """Multi-task training: interleaves slot-copy + reorder per step.
+
+    Args:
+        slot_weight: fraction of steps dedicated to slot-copy (rest = reorder).
+        seam_weight: fraction of steps dedicated to reorder (rest = slot-copy).
+        n_train_slots: number of training slots for slot-copy.
+        n_eval_slots: number of eval slots for slot-copy.
+
+    Returns dict with training history including per-task eval breakdown.
+    """
+    dev = resolve_device(device)
+    model = model.to(dev)
+    seed_guardrail(seed)
+
+    train_slots = [f"pkg{i:03d}" for i in range(n_train_slots)]
+    eval_slots = [f"pkg{i:03d}" for i in range(n_train_slots, n_train_slots + n_eval_slots)]
+    a_slots = [f"pkg{i:03d}" for i in range(n_train_slots)]
+    b_slots = [f"lib{i:03d}" for i in range(n_train_slots, n_train_slots * 2)]
+
+    eos = tok.token_to_id(EOS)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    history = {"losses": [], "slot_acc": [], "reorder_acc": [],
+               "eval_gate": [], "steps": [], "task_mix": []}
+    model.train()
+
+    for step in range(1, n_steps + 1):
+        # task selection by weight
+        use_seam = (torch.rand(1).item() > slot_weight)
+        if use_seam:
+            Xb, Yb, YcB, Gb, Ab, Sb, Rb = make_reorder_batch(
+                tok, a_slots, b_slots, bs=bs, seed=step, device=dev)
+            out = model(Xb, seam_anchor=Ab)
+            task_tag = "seam"
+        else:
+            Xb, Yb, YcB, Gb = make_slot_batch(
+                tok, train_slots, bs=bs, seed=step, device=dev)
+            out = model(Xb)
+            task_tag = "slot"
+
+        loss, lb, lg, lc = loss_v33(out, Yb, YcB, Gb, w_copy=w_copy)
+        if hasattr(model, 'moe_aux_loss'):
+            loss = loss + model.moe_aux_loss()
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        opt.step()
+        history["losses"].append(loss.item())
+        history["task_mix"].append(task_tag)
+
+        if callback:
+            callback(step, loss.item(), {"task": task_tag,
+                                          "blend": lb.item(),
+                                          "gen": lg.item(),
+                                          "copy": lc.item()})
+
+        if eval_every > 0 and (step % eval_every == 0 or step == n_steps):
+            # slot eval
+            s_acc, s_gate, _ = eval_slots(model, tok, eval_slots,
+                                           boundary_eos=True, device=dev)
+            # reorder eval
+            r_acc, r_gate = eval_reorders(model, tok, a_slots[:n_eval_slots],
+                                          b_slots[:n_eval_slots],
+                                          mode="hard", pos_eos=True,
+                                          device=dev)
+            history["slot_acc"].append(s_acc)
+            history["reorder_acc"].append(r_acc)
+            history["eval_gate"].append((s_gate + r_gate) / 2)
+            history["steps"].append(step)
+            print(f"step {step:5d} loss={loss.item():.4f} "
+                  f"slot={s_acc:.3f} reorder={r_acc:.3f} gate={s_gate:.3f}")
             model.train()
 
     return history

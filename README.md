@@ -156,6 +156,13 @@ harness + MoE scaling — all milestones shipped:
 - **M13**: Multi-task training — joint copy + reorder, no negative transfer
 - **M14**: Production deployment — size analysis, latency benchmarks, ONNX/Docker design
 Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
+**v8 ✅ (architecture upgrade)**: attention-seam combo + decode improvements:
+- **M15**: Vectorized IR — replaced Python loops in `_attn()`/`_forced_columns()` with vectorized torch ops (`scatter_`, `masked_fill_`); no `.item()` in hot path, `torch.compile` compatible
+- **M16**: Rich fingerprint — `(n_parts, seg_first)` → `(n_parts, seg_lens, seg_leads, sep_id)` for better task disambiguation
+- **M17**: AttentionSeedPointer — multi-head cross-attention replaces cosine similarity for prompt position selection
+- **M18**: `decode_perm()` — re-seeds pointer at every seam boundary for arbitrary permutations (generalizes `decode_rotate`)
+- **M20**: Architecture combo — `HMN3AttentionWR(seam_addr=True, attn_ptr=True)` merges attention-WR + seam + attention pointer in one model
+- **M21**: KV cache — `decode_v33(..., use_kv_cache=True)` caches K/V tensors for ~T× decode speedup
 
 ---
 
@@ -288,6 +295,8 @@ python retop.py train --data data/english_10m.jsonl --tok tok.json --out myai.pt
 python retop.py chat --checkpoint myai.pt --interactive
 # v7: train the attention-WR variant
 python retop.py train --data data/english_10m.jsonl --tok tok.json --out myai.pt --arch attention --spec attn-small
+# v8: train attention-seam combo (for reorder/transform tasks)
+python retop.py train --data data/english_10m.jsonl --tok tok.json --out myai.pt --arch attention --spec attn-seam-small
 ```
 
 `retop.py` auto-detects the machine (CPU/RAM/CUDA) and picks a verified spec.
@@ -308,28 +317,29 @@ retop-eval --model myai.pt --output report.json
 
 ```
 hmn/                        core package
-  __init__.py               HMN3, HMN3_NoReg, HMN3AttentionWR, config, packing, streaming
+  __init__.py               HMN3, HMN3_NoReg, HMN3AttentionWR, AttentionSeedPointer, config, packing, streaming
   v2.py                     SelectiveSSM, coupling, MoE, episodic memory
-  v3.py                     IdentityRegister, DualHeadDecoder, SeedPointer, HMN3
+  v3.py                     IdentityRegister, DualHeadDecoder, SeedPointer, AttentionSeedPointer, HMN3
   v7.py                     HMN3AttentionWR, RMSNorm, RoPE, SwiGLU, SparseConditionalComputeV2
-  config.py                 HMNConfig + create_model factory (presets: cpu-small..attn-large)
-  recipe.py                 v3.3 recipe + v5 seam + v7 train(): make_chat_ids,
-                            loss_v33, decode_v33(seam), make_reorder_batch,
-                            make_perm_batch, seam_losses, eval_reorders,
+  config.py                 HMNConfig + create_model factory (presets: cpu-small..attn-seam-medium)
+  recipe.py                 v3.3 recipe + v5 seam + v7 train() + v8 train_multitask():
+                            make_chat_ids, loss_v33, decode_v33(seam, kv_cache),
+                            decode_perm, train_multitask, make_reorder_batch,
+                            seam_losses, eval_reorders, eval_perms,
                             resolve_device   ← single source of truth
-  eval_harness.py           v7 M11: automated eval suite (slot/chain/reorder), JSON reports
+  eval_harness.py           v7 M11 + v8: automated eval suite (slot/chain/reorder/perm), JSON reports
   hf.py                     v6 M2: HF packaging — HMNForCausalLM, save/load pretrained
   packing.py                v6 M5: doc-masked padding, per-doc position_ids
   streaming.py              v6 M6: StreamJsonlReader, BoundedBufferShuffle
-  skills.py                 v5 M4 executable skill library (recipes,
-                            fingerprint retrieval, verify_plan coverage gate)
+  skills.py                 v5 M4 executable skill library (rich fingerprint v8 M16,
+                            recipes, verify_plan coverage gate)
 retop.py                    one-command tok / train / chat (writes config sidecar)
 train_v3.py                 v3 slot-copy trainer (uses hmn/recipe)
 gen_slots.py                slot-copy dataset generator (deterministic seen/unseen)
 gen_chat.py                 streaming EN/Math chat corpus generator (data/)
 infer.py                    load checkpoint + tokenizer, generate
 retop_gui.py                4-tab Gradio UI (DATA/TRAIN/CHAT/VERIFY)
-test_hmn.py                 model tests incl. v7 attention-WR + recipe guardrails
+test_hmn.py                 model tests incl. v7 attention-WR + v8 KV cache/perm/attn-seam
 hmn_v33.pt[.json]           verified checkpoint + recipe sidecar
 experiments/verified/slot_v33_seed42.py   one-command 40/40 guardrail
 experiments/verified/v4_guardrail.py      full v4 gate: tests + M1 + M8 + slots + chains
@@ -374,6 +384,10 @@ retop_tokenizer.json        the tokenizer (vocab 3190)
   RE-SEEDING (carry a fragment-start column through the seam so the pointer
   re-points content-addressably), an architectural change, not a flag.
   Honest boundary; default OFF.
+- **v8 known limitation**: `ptr3` plateau at ~0.7 — SeedPointer trained on one
+  task family doesn't generalize across families. The attention pointer (M17)
+  and rich fingerprint (M16) address this architecturally, but data diversity
+  (new task families) is still needed for full breakout.
 
 ### Reproducibility
 

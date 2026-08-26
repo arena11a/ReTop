@@ -22,7 +22,7 @@ from tokenizers import Tokenizer
 
 from hmn.v3 import HMN3
 from hmn.v7 import HMN3AttentionWR
-from hmn.recipe import (eval_slots, eval_slot_chains, eval_reorders,
+from hmn.recipe import (eval_slots, eval_slot_chains, eval_reorders, eval_perms,
                         make_reorder_batch, loss_v33, seed_guardrail,
                         ASSIST, EOS, CHAIN_SLOTS_A, CHAIN_SLOTS_B,
                         CHAIN_SLOTS_A_U, CHAIN_SLOTS_B_U)
@@ -87,9 +87,11 @@ def eval_checkpoint(model_path, tokenizer_path=None, device="cpu",
                         k.endswith(".ln1.weight")])
         has_moe = any("moe" in k for k in state_dict)
         has_seam = any("seed_ptr" in k for k in state_dict)
+        has_attn_ptr = any("seed_ptr.q_proj" in k for k in state_dict)
         m = HMN3AttentionWR(vocab, dim=dim, n_layers=n_layers,
                             n_experts=16, top_k=2, use_moe=has_moe,
-                            gate_bias=-1.0, asi_id=asid, seam_addr=has_seam)
+                            gate_bias=-1.0, asi_id=asid,
+                            seam_addr=has_seam, attn_ptr=has_attn_ptr)
     else:
         n_layers = len([k for k in state_dict if k.startswith("blocks.") and
                         k.endswith(".F1.ln.weight")])
@@ -133,6 +135,16 @@ def eval_checkpoint(model_path, tokenizer_path=None, device="cpu",
                                        mode="hard", pos_eos=True, device=device)
         results.append(EvalResult("reorder_unseen", acc_r, gate_r, n_reorder,
                                    time.time() - t2))
+
+    # Permutation (v8 M18: tests decode_perm path)
+    if n_reorder > 0 and has_seam:
+        t3 = time.time()
+        acc_p, gate_p = eval_perms(m, tok,
+                                   [f"pkg{i:03d}" for i in range(60, 60 + n_reorder)],
+                                   [f"lib{i:03d}" for i in range(60, 60 + n_reorder)],
+                                   pos_eos=True, device=device)
+        results.append(EvalResult("perm_unseen", acc_p, gate_p, n_reorder,
+                                   time.time() - t3))
 
     total_time = time.time() - t0
     return EvalReport(model_path=model_path, checkpoint_step=step,

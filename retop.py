@@ -66,6 +66,9 @@ SPECS = {
     "attn-small": dict(dim=96,  layers=3, moe=False, bs=8,  seq=96,  steps=4000, gate_bias=-1.0, variant="attention"),
     "attn-medium":dict(dim=128, layers=3, moe=False, bs=8,  seq=128, steps=6000, gate_bias=-1.0, variant="attention"),
     "attn-large": dict(dim=256, layers=4, moe=False, bs=8,  seq=192, steps=8000, gate_bias=0.0, variant="attention"),
+    # v8 M20: attention-WR + seam_addr + attention pointer
+    "attn-seam-small": dict(dim=96, layers=3, moe=False, bs=8, seq=96, steps=4000, gate_bias=-1.0, variant="attention", seam_addr=True, stem_addr=True, attn_ptr=True),
+    "attn-seam-medium": dict(dim=128, layers=3, moe=False, bs=8, seq=128, steps=6000, gate_bias=-1.0, variant="attention", seam_addr=True, stem_addr=True, attn_ptr=True),
 }
 
 
@@ -241,7 +244,10 @@ def build_model(arch, cfg, tok):
         return HMN3AttentionWR(cfg["vocab"], dim=cfg["dim"],
                                n_layers=cfg["layers"],
                                use_moe=cfg["moe"],
-                               gate_bias=cfg["gate_bias"], asi_id=asi)
+                               gate_bias=cfg["gate_bias"], asi_id=asi,
+                               seam_addr=cfg.get("seam_addr", False),
+                               stem_addr=cfg.get("stem_addr", False),
+                               attn_ptr=cfg.get("attn_ptr", False))
     return HMN3(cfg["vocab"], dim=cfg["dim"], state_dim=8,
                 n_layers=cfg["layers"], use_moe=cfg["moe"],
                 gate_bias=cfg["gate_bias"], asi_id=asi, aux_copy=True,

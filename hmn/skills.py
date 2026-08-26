@@ -34,19 +34,35 @@ from hmn.recipe import REORDER_AND, _find_all_word
 
 def parse_prompt(ids, asid, tok, sep=REORDER_AND):
     """Segment structure of the USER region -> dict(bounds, ands, n_parts,
-    seg_lens, asi_pos, fp). fp is the SLOT-INVARIANT retrieval fingerprint:
-    (n_parts, first-token-id of each segment) — verbs identify the task
-    template while slot contents stay wild."""
+    seg_lens, asi_pos, fp).
+
+    fp is the SLOT-INVARIANT retrieval fingerprint — a tuple of:
+      (n_parts, seg_lens_tuple, seg_first_token_ids, separator_id)
+
+    Why richer than v5's (n_parts, seg_first):
+      - seg_lens captures structural differences (e.g. "fetch X" vs "fetch X
+        and deploy Y and stop Z" have different segment-length patterns)
+      - separator_id distinguishes tasks that use different separators
+      - seg_first_token_ids is a tuple (not just first tokens but all
+        verb-leading tokens up to 3 per segment for disambiguation)
+    """
     asi_pos = ids.index(asid)
     U = ids[2:asi_pos]
     ands = _find_all_word(tok, U, sep)
     bounds = [-1] + ands + [len(U)]
     n_parts = len(ands) + 1
-    seg_lens = [bounds[k + 1] - bounds[k] - 1 for k in range(n_parts)]
-    seg_first = tuple(U[b + 1] for b in bounds[:-1])
+    seg_lens = tuple(bounds[k + 1] - bounds[k] - 1 for k in range(n_parts))
+    # up to 3 leading token ids per segment (verb tokens, excluding slots)
+    seg_leads = []
+    for k in range(n_parts):
+        lo = bounds[k] + 1
+        hi = min(lo + 3, bounds[k + 1])
+        seg_leads.append(tuple(U[lo:hi]))
+    sep_id = U[ands[0]] if ands else -1
+    fp = (n_parts, seg_lens, tuple(seg_leads), sep_id)
     return {"asi_pos": asi_pos, "U": U, "ands": ands, "bounds": bounds,
-            "n_parts": n_parts, "seg_lens": seg_lens, "seg_first": seg_first,
-            "fp": (n_parts, seg_first)}
+            "n_parts": n_parts, "seg_lens": seg_lens, "seg_first": tuple(U[b + 1] for b in bounds[:-1]),
+            "fp": fp}
 
 
 # ---------------------------------------------------------------------------

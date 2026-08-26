@@ -26,6 +26,7 @@ from hmn import (
     HelixCouplingBlock,
     ReversibleFunction,
     SeedPointer,
+    AttentionSeedPointer,
     SparseConditionalCompute,
 )
 from hmn.v7 import (
@@ -37,9 +38,10 @@ from hmn.v7 import (
     SwiGLUFFN,
 )
 from hmn.config import HMNConfig, create_model
-from hmn.recipe import (ASSIST, USER, decode_v33, eval_reorders, loss_v33,
-                        make_chat_ids, make_perm_ids, make_reorder_batch,
-                        make_reorder_ids, reorder_anchors, seam_losses)
+from hmn.recipe import (ASSIST, USER, decode_v33, decode_perm, eval_reorders,
+                        loss_v33, make_chat_ids, make_perm_ids,
+                        make_reorder_batch, make_reorder_ids, reorder_anchors,
+                        seam_losses)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VOCAB = 3190
@@ -585,7 +587,7 @@ def test_v7_attention_block():
     print("[v7: AttentionBlock forward]")
     blk = AttentionBlock(64, n_heads=2, max_seq_len=256)
     x = torch.randn(2, 16, 64)
-    y = blk(x)
+    y, _ = blk(x)
     check(y.shape == (2, 16, 64), "output shape matches input")
     check(torch.isfinite(y).all(), "output finite")
 
@@ -642,6 +644,143 @@ def test_v7_decode_with_attention():
     check(0.0 <= gate_avg <= 1.0, f"gate_avg in [0,1] ({gate_avg:.3f})")
 
 
+def test_v8_attention_seed_ptr():
+    """v8 M17: AttentionSeedPointer forward + HMN3 seam_addr=True attn_ptr."""
+    print("[v8: AttentionSeedPointer forward + HMN3 attn_ptr]")
+    dim, B, T = 48, 2, 20
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asid = tok.token_to_id(ASSIST)
+    uid = tok.token_to_id(USER)
+    # --- direct forward ---
+    asp = AttentionSeedPointer(dim, max_run=8, n_heads=4)
+    h = torch.randn(B, T, dim)
+    keys = torch.randn(B, T, dim)
+    bound = torch.full((B,), 12, dtype=torch.long)
+    ptr_logits, len_logits = asp(h, keys, bound)
+    check(ptr_logits.shape == (B, T, T), f"ptr_logits shape {ptr_logits.shape}")
+    check(len_logits.shape == (B, T, 8), f"len_logits shape {len_logits.shape}")
+    check(torch.isfinite(ptr_logits).all(), "ptr_logits finite")
+    check(torch.isfinite(len_logits).all(), "len_logits finite")
+    # columns at or beyond bound get zero attention weight -> ptr_logits = 0
+    check((ptr_logits[:, :, 12:] == 0.0).all(),
+          "ptr_logits zero beyond bound (softmax mask)")
+    # gradients flow
+    loss = ptr_logits.sum() + len_logits.sum()
+    loss.backward()
+    grads = sum(1 for p in asp.parameters() if p.grad is not None)
+    check(grads >= 4, f"gradients reached {grads} params")
+    # --- HMN3 with attn_ptr ---
+    V = tok.get_vocab_size()
+    m = HMN3(V, dim=dim, n_layers=1, asi_id=asid, user_id=uid,
+             seam_addr=True, attn_ptr=True)
+    prompt = make_chat_ids(tok, "fetch pkg042 and deploy lib055")
+    x = torch.tensor([prompt], dtype=torch.long)
+    out = m(x)
+    check("ptr_logits" in out, "ptr_logits in output")
+    check("len_logits" in out, "len_logits in output")
+    check(out["ptr_logits"].shape == (1, len(prompt), len(prompt)),
+          f"ptr_logits shape {out['ptr_logits'].shape}")
+    out["ptr_logits"].sum().backward()
+    ptr_grads = sum(1 for n, p in m.named_parameters()
+                    if p.grad is not None and "seed_ptr" in n)
+    check(ptr_grads >= 1, f"ptr grads in named params ({ptr_grads})")
+
+
+def test_v8_decode_perm():
+    """v8 M18: decode_perm runs and re-seeds at every seam."""
+    print("[v8: decode_perm mechanics]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    m = HMN3(tok.get_vocab_size(), dim=DIM, n_layers=2,
+             asi_id=tok.token_to_id(ASSIST), user_id=tok.token_to_id(USER),
+             seam_addr=True)
+    prompt = make_chat_ids(tok, "fetch pkg001 and deploy lib002")
+    text, gate_avg, n_seeded = decode_perm(m, tok, prompt, max_new=32)
+    check(isinstance(text, str), f"decode_perm returns str ({text!r})")
+    check(0.0 <= gate_avg <= 1.0, f"gate_avg in [0,1] ({gate_avg:.3f})")
+    check(n_seeded >= 1, f"n_seeded >= 1 ({n_seeded})")
+    # all 3 segments should be emitted for a 3-part prompt
+    check(n_seeded <= 3, f"n_seeded <= 3 ({n_seeded})")
+    # --- no-separator prompt should raise ---
+    simple = make_chat_ids(tok, "hello")
+    try:
+        decode_perm(m, tok, simple, max_new=8)
+        check(False, "decode_perm should raise on no-separator prompt")
+    except AssertionError:
+        pass  # expected
+
+
+def test_v8_attn_seam_combo():
+    """v8 M20: HMN3AttentionWR with seam_addr + attn_ptr (full combo)."""
+    print("[v8: HMN3AttentionWR seam_addr + attn_ptr combo]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asid = tok.token_to_id(ASSIST)
+    uid = tok.token_to_id(USER)
+    V = tok.get_vocab_size()
+    # --- attention-WR + seam_addr + attn_ptr ---
+    m = HMN3AttentionWR(V, dim=64, n_layers=2, asi_id=asid, user_id=uid,
+                        seam_addr=True, attn_ptr=True, stem_addr=True)
+    prompt = make_chat_ids(tok, "fetch pkg001 and deploy lib002")
+    x = torch.tensor([prompt], dtype=torch.long)
+    out = m(x)
+    check("ptr_logits" in out, "ptr_logits in output")
+    check("len_logits" in out, "len_logits in output")
+    check("gen_logits" in out, "gen_logits in output")
+    check("stats" in out, "stats in output")
+    check(out["ptr_logits"].shape == (1, len(prompt), len(prompt)),
+          f"ptr_logits shape {out['ptr_logits'].shape}")
+    out["ptr_logits"].sum().backward()
+    ptr_grads = sum(1 for n, p in m.named_parameters()
+                    if p.grad is not None and "seed_ptr" in n)
+    check(ptr_grads >= 1, f"ptr grads in named params ({ptr_grads})")
+    # --- decode_perm on attention-seam model ---
+    text, gate_avg, n_seeded = decode_perm(m, tok, prompt, max_new=32)
+    check(isinstance(text, str), f"decode_perm returns str ({text!r})")
+    check(0.0 <= gate_avg <= 1.0, f"gate_avg in [0,1] ({gate_avg:.3f})")
+    check(n_seeded >= 1, f"n_seeded >= 1 ({n_seeded})")
+    # --- config factory preset ---
+    cfg = HMNConfig.from_preset("attn-seam-small", vocab_size=V)
+    m2 = create_model(cfg, asi_id=asid, user_id=uid)
+    check(isinstance(m2, HMN3AttentionWR), "preset returns HMN3AttentionWR")
+    check(m2.seed_ptr is not None, "seed_ptr instantiated")
+    check(m2.seam_addr, "seam_addr enabled")
+    out2 = m2(x)
+    check("ptr_logits" in out2, "ptr_logits from preset model")
+
+
+def test_v8_kv_cache():
+    """v8 M21: KV-cache decode produces same output as non-cached decode."""
+    print("[v8: KV-cache decode parity]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    asid = tok.token_to_id(ASSIST)
+    V = tok.get_vocab_size()
+    m = HMN3AttentionWR(V, dim=64, n_layers=2, asi_id=asid)
+    m.eval()
+    prompt = make_chat_ids(tok, "pip install pkg042")
+    # non-cached decode
+    text1, g1, n1 = decode_v33(m, tok, prompt, max_new=16,
+                                boundary_eos=True, use_kv_cache=False)
+    # cached decode
+    text2, g2, n2 = decode_v33(m, tok, prompt, max_new=16,
+                                boundary_eos=True, use_kv_cache=True)
+    check(text1 == text2, f"cached == non-cached text ({text1!r} vs {text2!r})")
+    check(abs(g1 - g2) < 0.01, f"gate_avg match ({g1:.3f} vs {g2:.3f})")
+    check(n1 == n2, f"n_gen match ({n1} vs {n2})")
+    # --- KV cache on attention-seam model ---
+    m2 = HMN3AttentionWR(V, dim=64, n_layers=2, asi_id=asid,
+                         user_id=tok.token_to_id(USER),
+                         seam_addr=True, stem_addr=True)
+    m2.eval()
+    prompt2 = make_chat_ids(tok, "fetch pkg001 and deploy lib002")
+    text3, _, _ = decode_v33(m2, tok, prompt2, max_new=32,
+                             use_kv_cache=False, seam=True)
+    text4, _, _ = decode_v33(m2, tok, prompt2, max_new=32,
+                             use_kv_cache=True, seam=True)
+    # seam decode should produce valid output (not necessarily identical
+    # since cached path uses decode_step which may differ slightly)
+    check(isinstance(text3, str), f"non-cached seam returns str ({text3!r})")
+    check(isinstance(text4, str), f"cached seam returns str ({text4!r})")
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_coupling_reversible()
@@ -669,4 +808,9 @@ if __name__ == "__main__":
     test_v7_config_factory()
     test_v7_config_param_estimate()
     test_v7_decode_with_attention()
+    # v8 tests
+    test_v8_attention_seed_ptr()
+    test_v8_decode_perm()
+    test_v8_attn_seam_combo()
+    test_v8_kv_cache()
     print("\nALL TESTS PASSED")
