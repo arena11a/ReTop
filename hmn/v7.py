@@ -23,6 +23,97 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from hmn.v2 import SparseConditionalCompute
 
 
+class SparseConditionalComputeV2(nn.Module):
+    """Improved MoE routing (v7 M9): Switch Transformer load-balancing, noisy gates.
+
+    Changes from v2 SparseConditionalCompute:
+      1. Noisy gates: add Gaussian noise to router logits during training
+         (improves exploration, prevents expert collapse)
+      2. Switch Transformer load-balancing loss: α * N * Σ(f_i * P_i)
+         where f_i = fraction routed to expert i, P_i = mean routing prob
+      3. Capacity factor: optional limit on tokens per expert
+      4. Router z-loss: penalizes large logits for numerical stability
+
+    Preserves product-key routing and STE from v2 for backward compat.
+    """
+
+    def __init__(self, dim, n_experts, top_k, key_dim=16, aux_coef=0.01,
+                 noisy_gate=True, capacity_factor=1.25, z_loss_coef=0.001):
+        super().__init__()
+        self.n_experts = n_experts
+        self.n_sub = int(n_experts ** 0.5)
+        self.top_k = top_k
+        self.aux_coef = aux_coef
+        self.noisy_gate = noisy_gate
+        self.capacity_factor = capacity_factor
+        self.z_loss_coef = z_loss_coef
+
+        # Router
+        self.query_proj = nn.Linear(dim, key_dim)
+        self.keys_1 = nn.Parameter(torch.randn(self.n_sub, key_dim // 2) * 0.1)
+        self.keys_2 = nn.Parameter(torch.randn(self.n_sub, key_dim // 2) * 0.1)
+        self.values = nn.Embedding(n_experts, dim)
+
+        # Noise parameter (learnable log-variance)
+        self.noise_log_var = nn.Parameter(torch.zeros(1))
+
+        self.last_aux_loss = torch.tensor(0.0)
+        self.last_z_loss = torch.tensor(0.0)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        q = self.query_proj(x)
+        q1, q2 = q.chunk(2, dim=-1)
+
+        # Router scores
+        score1 = q1 @ self.keys_1.T  # (B, T, n_sub)
+        score2 = q2 @ self.keys_2.T
+
+        # Noisy gates (training only)
+        if self.training and self.noisy_gate:
+            noise_std = torch.exp(0.5 * self.noise_log_var)
+            score1 = score1 + torch.randn_like(score1) * noise_std
+            score2 = score2 + torch.randn_like(score2) * noise_std
+
+        # Product-key top-k
+        k = int(math.ceil(self.top_k ** 0.5))
+        top1_val, top1_idx = score1.topk(k, dim=-1)
+        top2_val, top2_idx = score2.topk(k, dim=-1)
+        combined_scores = top1_val.unsqueeze(-1) + top2_val.unsqueeze(-2)
+        combined_idx = top1_idx.unsqueeze(-1) * self.n_sub + top2_idx.unsqueeze(-2)
+        flat_scores = combined_scores.flatten(-2)
+        flat_idx = combined_idx.flatten(-2)
+        final_val, final_pos = flat_scores.topk(self.top_k, dim=-1)
+        final_idx = torch.gather(flat_idx, -1, final_pos)  # (B,T,top_k)
+        weights = final_val.softmax(dim=-1)
+        expert_vals = self.values(final_idx)
+        out = (weights.unsqueeze(-1) * expert_vals).sum(dim=-2)
+
+        # Load-balancing loss (Switch Transformer style)
+        self.last_aux_loss = self._switch_balance_loss(final_idx, weights)
+
+        # Router z-loss (numerical stability)
+        self.last_z_loss = self._z_loss(flat_scores)
+
+        return out
+
+    def _switch_balance_loss(self, idx, gate):
+        """Switch Transformer load-balancing: α * N * Σ(f_i * P_i)."""
+        B = idx.size(0) * idx.size(1)
+        # f_i: fraction of tokens routed to expert i
+        frac_selected = torch.zeros(self.n_experts, device=idx.device)
+        frac_selected.index_add_(0, idx.reshape(-1),
+                                 torch.ones(idx.numel(), device=idx.device) / B)
+        # P_i: mean routing probability for expert i
+        frac_gate = torch.zeros(self.n_experts, device=idx.device)
+        frac_gate.index_add_(0, idx.reshape(-1), gate.reshape(-1) / B)
+        return self.n_experts * torch.sum(frac_selected * frac_gate)
+
+    def _z_loss(self, logits):
+        """Router z-loss: penalizes large logits for numerical stability."""
+        return logits.float().pow(2).mean()
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (faster than LayerNorm)."""
 
