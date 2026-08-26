@@ -95,13 +95,20 @@ class HMNConfig:
         """Rough parameter count (exact depends on MoE/seam config)."""
         d, V, L = self.dim, self.vocab_size, self.n_layers
         embed = V * d
-        ssm = L * (4 * d * d + 4 * d * self.state_dim)  # coupling blocks
+        if self.variant == "attention":
+            # AttentionBlock: QKV (3d^2) + out (d^2) + SwiGLU (2*d*4d=8d^2)
+            # + 2x RMSNorm (2d) = 12d^2 + 2d per layer
+            backbone = L * (12 * d * d + 2 * d)
+        else:
+            # HelixCouplingBlock: 4 coupling params per layer
+            backbone = L * (4 * d * d + 4 * d * self.state_dim)
         head = d * V  # gen head (tied = 0 extra)
         ir = 1  # beta param
         moe = 0
         if self.use_moe:
-            moe = L * (d * 16 + self.n_experts * d + 16 * d)
-        return embed + ssm + head + ir + moe
+            n_sub = int(self.n_experts ** 0.5)
+            moe = L * (d * 16 + n_sub * 16 + self.n_experts * d)
+        return embed + backbone + head + ir + moe
 
 
 def create_model(config, asi_id=None, user_id=None, **overrides):
@@ -166,6 +173,7 @@ def create_model(config, asi_id=None, user_id=None, **overrides):
             max_run=cfg_dict["max_run"],
             max_seq_len=config.max_seq_len,
             use_checkpoint=config.use_checkpoint,
+            dropout=config.dropout,
         )
     else:
         return HMN3(**cfg_dict)

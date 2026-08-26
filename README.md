@@ -146,6 +146,16 @@ milestones shipped:
 - **M6**: Streaming data — StreamJsonlReader, BoundedBufferShuffle, InfiniteStreamDataset
 - **M7**: Triton design notes + torch.compile probe (CPU break-even–1.26×)
 Roadmap: [`docs/v6_scaling_roadmap.md`](docs/v6_scaling_roadmap.md).
+**v7 ✅ (branch `v6`, 25 commits ahead)**: attention-WR variant + evaluation
+harness + MoE scaling — all milestones shipped:
+- **M8**: Attention-WR — Pre-LN + RoPE + RMSNorm + SwiGLU blocks replacing SelectiveSSM coupling; gradient checkpointing for memory efficiency
+- **M9**: MoE routing — Switch Transformer load-balancing, noisy gates, router z-loss (`SparseConditionalComputeV2`)
+- **M10**: Long-context scaling — T=512/1024/2048/4096 verified, packed sequences
+- **M11**: Evaluation harness — automated slot-copy/chain/reorder evals, JSON reports, checkpoint comparison (`retop-eval`)
+- **M12**: Distillation — KD loss (KL + CE), student retains 100% teacher accuracy
+- **M13**: Multi-task training — joint copy + reorder, no negative transfer
+- **M14**: Production deployment — size analysis, latency benchmarks, ONNX/Docker design
+Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
 
 ---
 
@@ -276,11 +286,21 @@ python gen_chat.py --domain math_advanced --target-tokens 120_000_000 --out data
 python retop.py tok --data my_corpus.txt --out tok.json --vocab 4000
 python retop.py train --data data/english_10m.jsonl --tok tok.json --out myai.pt
 python retop.py chat --checkpoint myai.pt --interactive
+# v7: train the attention-WR variant
+python retop.py train --data data/english_10m.jsonl --tok tok.json --out myai.pt --arch attention --spec attn-small
 ```
 
 `retop.py` auto-detects the machine (CPU/RAM/CUDA) and picks a verified spec.
 Data formats (slot-copy, chat pairs, plain text) are documented in
 [`docs/data_prep.md`](docs/data_prep.md).
+
+### Evaluate a checkpoint
+
+```bash
+python -m hmn.eval_harness --model myai.pt
+# or via entry point after `pip install -e .`:
+retop-eval --model myai.pt --output report.json
+```
 
 ---
 
@@ -288,13 +308,19 @@ Data formats (slot-copy, chat pairs, plain text) are documented in
 
 ```
 hmn/                        core package
-  __init__.py               HMN, HMN_Option1, HMN3, HMN3_NoReg
+  __init__.py               HMN3, HMN3_NoReg, HMN3AttentionWR, config, packing, streaming
   v2.py                     SelectiveSSM, coupling, MoE, episodic memory
   v3.py                     IdentityRegister, DualHeadDecoder, SeedPointer, HMN3
-  recipe.py                 v3.3 recipe + v5 seam machinery: make_chat_ids,
+  v7.py                     HMN3AttentionWR, RMSNorm, RoPE, SwiGLU, SparseConditionalComputeV2
+  config.py                 HMNConfig + create_model factory (presets: cpu-small..attn-large)
+  recipe.py                 v3.3 recipe + v5 seam + v7 train(): make_chat_ids,
                             loss_v33, decode_v33(seam), make_reorder_batch,
                             make_perm_batch, seam_losses, eval_reorders,
                             resolve_device   ← single source of truth
+  eval_harness.py           v7 M11: automated eval suite (slot/chain/reorder), JSON reports
+  hf.py                     v6 M2: HF packaging — HMNForCausalLM, save/load pretrained
+  packing.py                v6 M5: doc-masked padding, per-doc position_ids
+  streaming.py              v6 M6: StreamJsonlReader, BoundedBufferShuffle
   skills.py                 v5 M4 executable skill library (recipes,
                             fingerprint retrieval, verify_plan coverage gate)
 retop.py                    one-command tok / train / chat (writes config sidecar)
@@ -303,7 +329,7 @@ gen_slots.py                slot-copy dataset generator (deterministic seen/unse
 gen_chat.py                 streaming EN/Math chat corpus generator (data/)
 infer.py                    load checkpoint + tokenizer, generate
 retop_gui.py                4-tab Gradio UI (DATA/TRAIN/CHAT/VERIFY)
-test_hmn.py                 model tests incl. recipe guardrails
+test_hmn.py                 model tests incl. v7 attention-WR + recipe guardrails
 hmn_v33.pt[.json]           verified checkpoint + recipe sidecar
 experiments/verified/slot_v33_seed42.py   one-command 40/40 guardrail
 experiments/verified/v4_guardrail.py      full v4 gate: tests + M1 + M8 + slots + chains

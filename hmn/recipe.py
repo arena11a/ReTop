@@ -1053,7 +1053,7 @@ def train(model, tok, slots=None, n_steps=200, bs=1, lr=3e-4,
 
     eos = tok.token_to_id(EOS)
     asid = tok.token_to_id(ASSIST)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
     history = {"losses": [], "eval_acc": [], "eval_gate": [], "steps": []}
     model.train()
@@ -1070,6 +1070,9 @@ def train(model, tok, slots=None, n_steps=200, bs=1, lr=3e-4,
                 templates=templates, device=dev)
             out = model(Xb)
             loss, lb, lg, lc = loss_v33(out, Yb, YcB, Gb, w_copy=w_copy)
+
+        if hasattr(model, 'moe_aux_loss'):
+            loss = loss + model.moe_aux_loss()
 
         opt.zero_grad()
         loss.backward()

@@ -8,7 +8,7 @@ Key design decisions:
   - RMSNorm (faster than LayerNorm, same quality)
   - RoPE for position encoding (proven at scale)
   - SwiGLU FFN (gated activation, proven at scale)
-  - Optional MoE on the FFN (same SparseConditionalCompute)
+  - Optional MoE on the FFN (SparseConditionalComputeV2 with improved routing)
   - Gradient checkpointing (attention is NOT reversible)
   - Same output shape (B, T, dim) as SSM-WR — IR + head unchanged
 
@@ -20,7 +20,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from hmn.v2 import SparseConditionalCompute
 from hmn.v3 import IdentityRegister, DualHeadDecoder, SeedPointer
 
 
@@ -252,7 +251,7 @@ class HMN3AttentionWR(nn.Module):
                  n_experts=16, top_k=2, use_moe=False, tie_weights=True,
                  gate_bias=0.0, asi_id=None, user_id=None,
                  stem_addr=False, seam_addr=False, max_run=16,
-                 max_seq_len=8192, use_checkpoint=True):
+                 max_seq_len=8192, use_checkpoint=True, dropout=0.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -263,14 +262,15 @@ class HMN3AttentionWR(nn.Module):
 
         # Attention-WR blocks
         self.blocks = nn.ModuleList([
-            AttentionBlock(dim, n_heads=n_heads, max_seq_len=max_seq_len)
+            AttentionBlock(dim, n_heads=n_heads, max_seq_len=max_seq_len,
+                           dropout=dropout)
             for _ in range(n_layers)
         ])
 
-        # MoE (optional, same as SSM-WR)
+        # MoE (optional, uses SparseConditionalComputeV2 with improved routing)
         self.use_moe = use_moe
         self.moe_list = nn.ModuleList([
-            SparseConditionalCompute(dim, n_experts, top_k) if use_moe else None
+            SparseConditionalComputeV2(dim, n_experts, top_k) if use_moe else None
             for _ in range(n_layers)
         ])
 

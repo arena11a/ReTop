@@ -19,7 +19,8 @@ import torch
 
 from tokenizers import Tokenizer
 
-from hmn import HMN3
+from hmn import HMN3, HMN3AttentionWR
+from hmn.checkpoint import load_compat
 from hmn.recipe import decode_v33, make_chat_ids, resolve_device
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,10 @@ def build_model(arch, args, tok):
                     use_think=args.think, k_max=args.k_max,
                     asi_id=tok.token_to_id(ASI),
                     exact_blend=args.exact_blend)
+    if arch == "attention":
+        return HMN3AttentionWR(vocab, dim=args.dim, n_layers=args.layers,
+                               use_moe=args.moe, gate_bias=args.gate_bias,
+                               asi_id=tok.token_to_id(ASI))
     raise ValueError(f"unknown --arch {arch!r}")
 
 
@@ -53,7 +58,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--checkpoint", required=True, help=".pt state_dict to load")
-    ap.add_argument("--arch", default="v3", choices=["v3"])
+    ap.add_argument("--arch", default="v3", choices=["v3", "attention"])
     ap.add_argument("--tok", default=os.path.join(ROOT, "retop_tokenizer.json"))
     ap.add_argument("--dim", type=int, default=64)
     ap.add_argument("--state", type=int, default=8)

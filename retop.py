@@ -37,8 +37,9 @@ import torch.nn as nn
 
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-from hmn import HMN3, HMN3_NoReg
+from hmn import HMN3, HMN3_NoReg, HMN3AttentionWR
 from hmn.checkpoint import load_compat
+from hmn.config import HMNConfig, create_model
 from hmn.recipe import (decode_v33, loss_v33, make_chat_ids, make_chat_targets,
                         resolve_device, seed_guardrail)
 
@@ -56,11 +57,15 @@ SPECIAL_TOKENS = [BOS, EOS, UNK, PAD, USER, ASSIST]
 # cells -> not parametrized here (v3 uses in-context register). bs/seq/steps
 # scale with the machine so "auto" is genuinely usable on a weak box.
 SPECS = {
-    "tiny":   dict(dim=64,  layers=3, moe=False, bs=8,  seq=64,  steps=2500, gate_bias=-1.0),
-    "small":  dict(dim=96,  layers=3, moe=False, bs=8,  seq=96,  steps=4000, gate_bias=-1.0),
-    "medium": dict(dim=144, layers=4, moe=True,  bs=8,  seq=128, steps=6000, gate_bias=-1.0),
-    "large":  dict(dim=192, layers=6, moe=True,  bs=12, seq=160, steps=8000, gate_bias=0.0),
-    "xl":     dict(dim=256, layers=8, moe=True,  bs=16, seq=192, steps=10000, gate_bias=0.0),
+    "tiny":       dict(dim=64,  layers=3, moe=False, bs=8,  seq=64,  steps=2500, gate_bias=-1.0),
+    "small":      dict(dim=96,  layers=3, moe=False, bs=8,  seq=96,  steps=4000, gate_bias=-1.0),
+    "medium":     dict(dim=144, layers=4, moe=True,  bs=8,  seq=128, steps=6000, gate_bias=-1.0),
+    "large":      dict(dim=192, layers=6, moe=True,  bs=12, seq=160, steps=8000, gate_bias=0.0),
+    "xl":         dict(dim=256, layers=8, moe=True,  bs=16, seq=192, steps=10000, gate_bias=0.0),
+    "attn-tiny":  dict(dim=64,  layers=2, moe=False, bs=8,  seq=64,  steps=2500, gate_bias=-1.0, variant="attention"),
+    "attn-small": dict(dim=96,  layers=3, moe=False, bs=8,  seq=96,  steps=4000, gate_bias=-1.0, variant="attention"),
+    "attn-medium":dict(dim=128, layers=3, moe=False, bs=8,  seq=128, steps=6000, gate_bias=-1.0, variant="attention"),
+    "attn-large": dict(dim=256, layers=4, moe=False, bs=8,  seq=192, steps=8000, gate_bias=0.0, variant="attention"),
 }
 
 
@@ -228,9 +233,15 @@ class Dataset:
 
 def build_model(arch, cfg, tok):
     asi = tok.token_to_id(ASSIST) if tok.token_to_id(ASSIST) is not None else None
+    variant = cfg.get("variant", "ssm")
     if arch == "plain":
         return HMN3_NoReg(cfg["vocab"], dim=cfg["dim"], state_dim=8,
                           n_layers=cfg["layers"])
+    if variant == "attention":
+        return HMN3AttentionWR(cfg["vocab"], dim=cfg["dim"],
+                               n_layers=cfg["layers"],
+                               use_moe=cfg["moe"],
+                               gate_bias=cfg["gate_bias"], asi_id=asi)
     return HMN3(cfg["vocab"], dim=cfg["dim"], state_dim=8,
                 n_layers=cfg["layers"], use_moe=cfg["moe"],
                 gate_bias=cfg["gate_bias"], asi_id=asi, aux_copy=True,
@@ -269,7 +280,9 @@ def train(args, cfg):
             # already a probability and CE would log-softmax it again, pinning
             # the loss at ~ln(VOCAB) with no gradient.
             loss, l_blend, l_gen, l_copy = loss_v33(out, Y, Yc, G, lossf=lossf,
-                                                    w_copy=args.w_copy)
+                                                     w_copy=args.w_copy)
+            if hasattr(model, 'moe_aux_loss'):
+                loss = loss + model.moe_aux_loss()
         else:
             loss = lossf(out.reshape(-1, vocab), Y.reshape(-1))
         loss.backward()
@@ -360,8 +373,9 @@ def main():
     p.add_argument("--spec", default="auto",
                    choices=["auto"] + list(SPECS),
                    help="architecture size (auto = from this machine)")
-    p.add_argument("--arch", default="v3", choices=["v3", "plain"],
-                   help="v3 = dual-head copy+gen (default), plain = softmax-only")
+    p.add_argument("--arch", default="v3", choices=["v3", "plain", "attention"],
+                   help="v3 = dual-head copy+gen (default), plain = softmax-only, "
+                        "attention = v7 attention-WR variant")
     p.add_argument("--steps", type=int, default=None, help="override spec steps")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--w-copy", type=float, default=1.0)

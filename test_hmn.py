@@ -28,6 +28,15 @@ from hmn import (
     SeedPointer,
     SparseConditionalCompute,
 )
+from hmn.v7 import (
+    HMN3AttentionWR,
+    SparseConditionalComputeV2,
+    AttentionBlock,
+    RMSNorm,
+    RotaryPositionEmbedding,
+    SwiGLUFFN,
+)
+from hmn.config import HMNConfig, create_model
 from hmn.recipe import (ASSIST, USER, decode_v33, eval_reorders, loss_v33,
                         make_chat_ids, make_perm_ids, make_reorder_batch,
                         make_reorder_ids, reorder_anchors, seam_losses)
@@ -504,7 +513,7 @@ def test_skills_recipes_and_coverage():
     check(ok_rows, "rotate anchor columns are legal prompt columns")
     # the historical bug: echo must INCLUDE separators (sum(seg_lens) didn't)
     Pe = S.parse_prompt(make_chat_ids(tok, "fetch pkg028 and deploy lib055",
-                                      None) if False else
+                                       None) if False else
                         make_chat_ids(tok, "fetch pkg028 and deploy lib055"),
                         asid, tok)
     ep = S.echo_recipe(Pe)
@@ -521,6 +530,116 @@ def test_skills_recipes_and_coverage():
     entry, status = lib.match(Pe["fp"], family="echo")
     check(status == "hit" and entry["family"] == "echo",
           "hint resolves the ambiguity")
+
+
+# ---------------------------------------------------------------------------
+# v7 tests
+# ---------------------------------------------------------------------------
+
+def test_v7_attention_wr_forward():
+    print("[v7: HMN3AttentionWR forward + backward]")
+    m = HMN3AttentionWR(VOCAB, dim=64, n_layers=2, use_moe=False,
+                        gate_bias=-1.0, asi_id=5)
+    out = m(rand_ids())
+    check("stats" in out and "gen_logits" in out and "g" in out,
+          "returns stats/gen_logits/g")
+    check(out["gen_logits"].shape == (2, 16, VOCAB), "gen_logits shape")
+    check(torch.isfinite(out["gen_logits"]).all(), "gen_logits finite")
+    Y = rand_ids()
+    Yc = Y.clone()
+    Yc[:, 0] = -100
+    G = torch.ones_like(Y, dtype=torch.float)
+    G[:, 0] = 0.0
+    loss, l_blend, l_gen, l_copy = loss_v33(out, Y, Yc, G)
+    loss.backward()
+    n_grad = sum(1 for p in m.parameters() if p.grad is not None)
+    check(n_grad > 0, f"gradients reached {n_grad} params")
+    check(torch.isfinite(loss), "loss_v33 finite")
+
+
+def test_v7_attention_wr_moe():
+    print("[v7: HMN3AttentionWR with MoE (SparseConditionalComputeV2)]")
+    m = HMN3AttentionWR(VOCAB, dim=64, n_layers=2, use_moe=True,
+                        n_experts=16, top_k=2, gate_bias=-1.0, asi_id=5)
+    out = m(rand_ids())
+    check("stats" in out, "forward with MoE returns stats")
+    aux = m.moe_aux_loss()
+    check(torch.isfinite(aux) and aux.numel() == 1, f"MoE aux loss scalar ({aux.item():.4f})")
+    loss, _, _, _ = loss_v33(out, rand_ids(), rand_ids(), torch.ones(2, 16))
+    loss.backward()
+    n_grad = sum(1 for p in m.parameters() if p.grad is not None)
+    check(n_grad > 0, f"MoE backward reaches {n_grad} params")
+
+
+def test_v7_sparse_v2():
+    print("[v7: SparseConditionalComputeV2 — noisy gates, z-loss]")
+    moe = SparseConditionalComputeV2(32, n_experts=16, top_k=2)
+    moe.train()
+    moe(torch.randn(2, 10, 32))
+    check(torch.isfinite(moe.last_aux_loss), "aux loss finite")
+    check(torch.isfinite(moe.last_z_loss), "z-loss finite")
+    check(moe.last_z_loss.item() >= 0, "z-loss non-negative")
+
+
+def test_v7_attention_block():
+    print("[v7: AttentionBlock forward]")
+    blk = AttentionBlock(64, n_heads=2, max_seq_len=256)
+    x = torch.randn(2, 16, 64)
+    y = blk(x)
+    check(y.shape == (2, 16, 64), "output shape matches input")
+    check(torch.isfinite(y).all(), "output finite")
+
+
+def test_v7_rms_norm():
+    print("[v7: RMSNorm]")
+    norm = RMSNorm(64)
+    x = torch.randn(2, 16, 64)
+    y = norm(x)
+    check(y.shape == x.shape, "shape preserved")
+    # RMSNorm normalizes to unit RMS
+    rms = y.pow(2).mean(-1).sqrt()
+    check(torch.allclose(rms, torch.ones_like(rms), atol=1e-5),
+          "output has unit RMS")
+
+
+def test_v7_config_factory():
+    print("[v7: HMNConfig + create_model factory]")
+    cfg = HMNConfig.from_preset("attn-small")
+    check(cfg.variant == "attention", "attn-small preset variant")
+    check(cfg.dim == 64, "attn-small dim")
+    m = create_model(cfg, asi_id=5)
+    check(isinstance(m, HMN3AttentionWR), "create_model returns HMN3AttentionWR")
+    out = m(rand_ids(bs=1, t=8))
+    check("stats" in out, "factory model forward works")
+    # SSM preset
+    cfg2 = HMNConfig.from_preset("cpu-small")
+    m2 = create_model(cfg2, asi_id=5)
+    check(not isinstance(m2, HMN3AttentionWR), "cpu-small returns HMN3 (SSM)")
+    # string shortcut
+    m3 = create_model("attn-medium", asi_id=5)
+    check(isinstance(m3, HMN3AttentionWR), "string preset works")
+
+
+def test_v7_config_param_estimate():
+    print("[v7: HMNConfig.param_count_estimate branches on variant]")
+    cfg_ssm = HMNConfig(dim=96, n_layers=3, variant="ssm")
+    cfg_attn = HMNConfig(dim=96, n_layers=3, variant="attention")
+    # attention should have more params than SSM for same dim/layers
+    check(cfg_attn.param_count_estimate() > cfg_ssm.param_count_estimate(),
+          f"attention estimate ({cfg_attn.param_count_estimate()}) > "
+          f"SSM estimate ({cfg_ssm.param_count_estimate()})")
+
+
+def test_v7_decode_with_attention():
+    print("[v7: decode_v33 on attention-WR model]")
+    tok = Tokenizer.from_file(os.path.join(ROOT, "retop_tokenizer.json"))
+    m = HMN3AttentionWR(tok.get_vocab_size(), dim=64, n_layers=2,
+                        gate_bias=-1.0, asi_id=tok.token_to_id(ASSIST))
+    prompt = make_chat_ids(tok, "pip install pkg042")
+    out_txt, gate_avg, n_gen = decode_v33(m, tok, prompt, max_new=16,
+                                          boundary_eos=True)
+    check(isinstance(out_txt, str), f"decode returns text ({out_txt!r})")
+    check(0.0 <= gate_avg <= 1.0, f"gate_avg in [0,1] ({gate_avg:.3f})")
 
 
 if __name__ == "__main__":
@@ -541,4 +660,13 @@ if __name__ == "__main__":
     test_reorder_anchors_and_batch()
     test_decode_seam_mechanics()
     test_skills_recipes_and_coverage()
+    # v7 tests
+    test_v7_attention_wr_forward()
+    test_v7_attention_wr_moe()
+    test_v7_sparse_v2()
+    test_v7_attention_block()
+    test_v7_rms_norm()
+    test_v7_config_factory()
+    test_v7_config_param_estimate()
+    test_v7_decode_with_attention()
     print("\nALL TESTS PASSED")

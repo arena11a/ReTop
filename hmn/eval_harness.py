@@ -21,6 +21,7 @@ import torch
 from tokenizers import Tokenizer
 
 from hmn.v3 import HMN3
+from hmn.v7 import HMN3AttentionWR
 from hmn.recipe import (eval_slots, eval_slot_chains, eval_reorders,
                         make_reorder_batch, loss_v33, seed_guardrail,
                         ASSIST, EOS, CHAIN_SLOTS_A, CHAIN_SLOTS_B,
@@ -80,15 +81,24 @@ def eval_checkpoint(model_path, tokenizer_path=None, device="cpu",
     # Detect model config from state dict
     dim = state_dict["embed.weight"].shape[1]
     vocab = state_dict["embed.weight"].shape[0]
-    n_layers = len([k for k in state_dict if k.startswith("blocks.") and
-                    k.endswith(".F1.ln.weight")])
-    state_dim = state_dict["blocks.0.F1.A_log"].shape[1]
-    has_moe = any("moe" in k for k in state_dict)
-    has_seam = any("seed_ptr" in k for k in state_dict)
-
-    m = HMN3(vocab, dim=dim, state_dim=state_dim, n_layers=n_layers,
-             n_experts=16, top_k=2, use_moe=has_moe, gate_bias=-1.0,
-             asi_id=asid, seam_addr=has_seam)
+    is_attention = "blocks.0.qkv.weight" in state_dict
+    if is_attention:
+        n_layers = len([k for k in state_dict if k.startswith("blocks.") and
+                        k.endswith(".ln1.weight")])
+        has_moe = any("moe" in k for k in state_dict)
+        has_seam = any("seed_ptr" in k for k in state_dict)
+        m = HMN3AttentionWR(vocab, dim=dim, n_layers=n_layers,
+                            n_experts=16, top_k=2, use_moe=has_moe,
+                            gate_bias=-1.0, asi_id=asid, seam_addr=has_seam)
+    else:
+        n_layers = len([k for k in state_dict if k.startswith("blocks.") and
+                        k.endswith(".F1.ln.weight")])
+        state_dim = state_dict["blocks.0.F1.A_log"].shape[1]
+        has_moe = any("moe" in k for k in state_dict)
+        has_seam = any("seed_ptr" in k for k in state_dict)
+        m = HMN3(vocab, dim=dim, state_dim=state_dim, n_layers=n_layers,
+                 n_experts=16, top_k=2, use_moe=has_moe, gate_bias=-1.0,
+                 asi_id=asid, seam_addr=has_seam)
     m.load_state_dict(state_dict, strict=False)
     m.to(device)
     m.eval()

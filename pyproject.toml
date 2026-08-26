@@ -24,6 +24,7 @@ scale = ["triton>=3.0", "deepspeed>=0.14"]
 retop = "retop:main"
 retop-infer = "infer:main"
 retop-gui = "retop_gui:main"
+retop-eval = "hmn.eval_harness:main"
 
 [tool.setuptools]
 packages = ["hmn"]

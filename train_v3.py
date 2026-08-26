@@ -170,6 +170,8 @@ def main():
         else:
             vocab = out["logits"].shape[-1]
             loss = lossf(out["logits"].reshape(-1, vocab), Y.reshape(-1))
+        if hasattr(model, 'moe_aux_loss'):
+            loss = loss + model.moe_aux_loss()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         opt.step()
