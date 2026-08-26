@@ -39,10 +39,11 @@
 - Unseen verb generalization: 0.075 (up from 0.000)
 - **Conclusion**: Slight improvement but not enough
 
-## v9.4b: Structural Decoding (decode_rotate) ✓
-- Used rule-based structural rotation decoding
-- Still 0/5 on all unseen verb families
-- **Conclusion**: Structural decoding also depends on verb-specific tokens
+## v9.4: Head-to-Head — Attention vs SSM ✓
+- Slot-copy: both 1.000 (SSM with 25-46% fewer params)
+- Reorder: SSM 0.900 vs attention 0.700 at D=64
+- SSM is more parameter-efficient for ReTop's task profile
+- **Key finding**: SSM is the better default for ReTop
 
 ## Key Insights
 

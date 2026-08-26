@@ -186,6 +186,11 @@ Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
 - Benchmark: D=64 1.21x, D=128 0.79x, D=256 1.16x (avg ~1.1x)
 - Graph breaks from IRStats data-dependent branching (fundamental limit)
 
+**v9.4 ✅ (Head-to-Head)**: attention vs SSM comparison:
+- Slot-copy: both 1.000 (SSM with 25-46% fewer params)
+- Reorder: SSM 0.900 vs attention 0.700 at D=64
+- **Key finding**: SSM is the better default for ReTop
+
 **Key finding**: The ptr3 plateau is a training signal problem, not capacity/data. The model memorizes verb-specific token patterns instead of learning abstract swap structure. Custom tokenizer with verb-class tokens needed for v10+.
 
 ---
