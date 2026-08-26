@@ -36,6 +36,40 @@ ASSIST = "<|assistant|>"
 SPECIAL_TOKENS = [BOS, EOS, UNK, PAD, USER, ASSIST]
 
 
+def _pad_batch(seqs, extra_seqs=None, pad_vals=None, device=None):
+    """Pad variable-length sequences into a batch tensor.
+
+    seqs: list of list[int] — the main sequences (e.g. token ids)
+    extra_seqs: optional list of list — additional per-position arrays
+                (targets, gate targets, anchors, etc.)
+    pad_vals: dict mapping index to pad value for each array
+              {0: eos_id for seqs, 1: -100 for Y, ...}
+    device: torch device
+
+    Returns list of tensors: [Xb, Yb, ...] aligned with seqs + extra_seqs.
+    """
+    if pad_vals is None:
+        pad_vals = {}
+    dev = resolve_device(device)
+    T = max(len(x) for x in seqs)
+    all_seqs = [seqs] + ([extra_seqs] if extra_seqs else [])
+    result = []
+    for si, group in enumerate(all_seqs):
+        if group is None:
+            continue
+        pv = pad_vals.get(si, 0)
+        Tg = max(len(x) for x in group) if group else T
+        Tg = max(Tg, T)  # all groups share the same T
+        xb = torch.full((len(group), Tg), pv,
+                         dtype=torch.long if isinstance(pv, int) else torch.float,
+                         device=dev)
+        for j, x in enumerate(group):
+            xb[j, :len(x)] = torch.tensor(x, device=dev,
+                                           dtype=xb.dtype)
+        result.append(xb)
+    return result
+
+
 def resolve_device(device=None):
     """Pick the compute device for the session.
 
@@ -162,6 +196,7 @@ def make_slot_batch(tok, slots, bs, seed, template=DEFAULT_TEMPLATE,
         X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
     dev = resolve_device(device)
     T = max(len(x) for x in X)
+    eos_t = torch.tensor(eos, device=dev)
     Xb = torch.full((bs, T), eos, dtype=torch.long, device=dev)
     Yb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
     YcB = torch.full((bs, T), -100, dtype=torch.long, device=dev)
@@ -968,3 +1003,94 @@ def seed_guardrail(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     return seed
+
+
+# ---------------------------------------------------------------------------
+# v7: convenience training API
+# ---------------------------------------------------------------------------
+
+def train(model, tok, slots=None, n_steps=200, bs=1, lr=3e-4,
+          template=DEFAULT_TEMPLATE, templates=None, seed=42,
+          eval_every=50, eval_slots_list=None, device=None,
+          w_copy=1.0, seam=False, a_slots=None, b_slots=None,
+          callback=None):
+    """One-call training loop for slot-copy (and optionally reorder).
+
+    Args:
+        model: HMN3 or HMN3AttentionWR instance.
+        tok: tokenizer (tokenizers.Tokenizer).
+        slots: list of slot strings for training (default: pkg000-pkg039).
+        n_steps: number of training steps.
+        bs: batch size.
+        lr: learning rate.
+        template: format string with {slot} placeholder.
+        templates: list of format strings (multi-template training).
+        seed: random seed for reproducibility.
+        eval_every: evaluate every N steps (0 to disable).
+        eval_slots_list: slots for evaluation (default: unseen pkg060-pkg079).
+        device: compute device (auto-detect if None).
+        w_copy: copy loss weight.
+        seam: use seam/reorder training (requires a_slots, b_slots).
+        a_slots: slot A family for reorder training.
+        b_slots: slot B family for reorder training.
+        callback: optional fn(step, loss, metrics_dict) called each step.
+
+    Returns:
+        dict with training history: {losses: [...], eval_acc: [...], ...}.
+    """
+    dev = resolve_device(device)
+    model = model.to(dev)
+    seed_guardrail(seed)
+
+    if slots is None:
+        slots = [f"pkg{i:03d}" for i in range(40)]
+    if eval_slots_list is None:
+        eval_slots_list = [f"pkg{i:03d}" for i in range(60, 80)]
+    if seam and a_slots is None:
+        a_slots = [f"pkg{i:03d}" for i in range(40)]
+    if seam and b_slots is None:
+        b_slots = [f"lib{i:03d}" for i in range(40, 80)]
+
+    eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    history = {"losses": [], "eval_acc": [], "eval_gate": [], "steps": []}
+    model.train()
+
+    for step in range(1, n_steps + 1):
+        if seam:
+            Xb, Yb, YcB, Gb, Ab, Sb, Rb = make_reorder_batch(
+                tok, a_slots, b_slots, bs=bs, seed=step, device=dev)
+            out = model(Xb, seam_anchor=Ab)
+            loss, lb, lg, lc = loss_v33(out, Yb, YcB, Gb, w_copy=w_copy)
+        else:
+            Xb, Yb, YcB, Gb = make_slot_batch(
+                tok, slots, bs=bs, seed=step, template=template,
+                templates=templates, device=dev)
+            out = model(Xb)
+            loss, lb, lg, lc = loss_v33(out, Yb, YcB, Gb, w_copy=w_copy)
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        opt.step()
+        history["losses"].append(loss.item())
+
+        if callback:
+            callback(step, loss.item(), {"blend": lb.item(),
+                                          "gen": lg.item(),
+                                          "copy": lc.item()})
+
+        if eval_every > 0 and (step % eval_every == 0 or step == n_steps):
+            acc, gate, ngen = eval_slots(
+                model, tok, eval_slots_list, template=template,
+                boundary_eos=True, device=dev)
+            history["eval_acc"].append(acc)
+            history["eval_gate"].append(gate)
+            history["steps"].append(step)
+            print(f"step {step:5d} loss={loss.item():.4f} "
+                  f"eval={acc:.3f} gate={gate:.3f}")
+            model.train()
+
+    return history

@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from hmn.v2 import SparseConditionalCompute
+from hmn.v3 import IdentityRegister, DualHeadDecoder, SeedPointer
 
 
 class SparseConditionalComputeV2(nn.Module):
@@ -274,7 +275,6 @@ class HMN3AttentionWR(nn.Module):
         ])
 
         # IR + DualHeadDecoder (shared with SSM-WR)
-        from hmn.v3 import IdentityRegister, DualHeadDecoder, SeedPointer
         self.ir = IdentityRegister(dim, asi_id=asi_id,
                                    user_id=user_id, stem_addr=stem_addr)
         self.ir.set_vocab(vocab_size)

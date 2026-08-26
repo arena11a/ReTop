@@ -27,6 +27,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutput
 
 from hmn.v3 import HMN3
+from hmn.recipe import loss_v33
 
 
 class HMN3Config(PretrainedConfig):
@@ -165,18 +166,14 @@ class HMNForCausalLM(GenerationMixin, PreTrainedModel):
                 return_dict=True, **kwargs):
         out = self.hmn(input_ids)
         if labels is not None:
-            st = out["stats"]
-            genlp = out["gen_logits"]
-            g = out["g"].squeeze(-1)
-            lg_y = genlp.gather(2, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-            pc = st.prob_at(labels)
-            lp_c = torch.full_like(pc, float("-inf"))
-            nz = pc > 0
-            lp_c[nz] = pc[nz].log()
-            l_one = torch.logaddexp(torch.log1p(-g.clamp(max=1 - 1e-7)) + lg_y,
-                                    torch.log(g.clamp(min=1e-12)) + lp_c)
-            ymask = labels != -100
-            loss = -l_one[ymask].mean() if ymask.any() else genlp.new_zeros(())
+            # Reuse the centralized loss from recipe.py (no duplication)
+            # Build Yc and G from labels for loss_v33 compatibility
+            Yc = labels.clone()
+            Yc[Yc == -100] = -100  # keep as-is
+            G = torch.where(labels != -100,
+                            torch.ones_like(labels, dtype=torch.float),
+                            torch.full_like(labels, -1.0))
+            _, loss, _, _ = loss_v33(out, labels, Yc, G)
             return CausalLMOutput(loss=loss, logits=out["gen_logits"])
         logits = self._blended_logprobs(out)
         return CausalLMOutput(loss=None, logits=logits)
