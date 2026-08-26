@@ -196,9 +196,9 @@ HMN3 forward, eager vs compiled:
 
 | metric | value |
 |---|---|
-| eager | 18–38 ms/fwd (CPU wall noise across sessions) |
+| eager | 9–38 ms/fwd (CPU wall noise across sessions) |
 | compiled | 9–25 ms/fwd |
-| **speedup** | **1.26× – 2.80× across 3 sessions; typical ≈1.5×** |
+| **speedup** | **0.93× – 2.80× across 4 sessions; typical ≈1.5×** (CPU timing noise dominates at ~20 ms/fwd; treat as "free 1-2× where the graph is pointwise-heavy", not a benchmark) |
 | first-call compile | 14–77 s |
 | max \|Δ gen_logits\| compiled vs eager | **5.341e-05** (identical every session) |
 | max \|Δ g\| | **0.0** (bitwise) |
