@@ -1,172 +1,153 @@
-"""v6 M5 — sequence packing utilities (docs/v6_scaling_roadmap.md, M5).
+"""v6 M5 — sequence packing utilities (doc-masked, per-document positions).
 
-Scale training needs many short documents per step. Two doc-faithful forms
-live here ("packing is per-document with loss masks carried through, not
-naive concat"):
+Roadmap item (docs/v6_scaling_roadmap.md M5): "sequence packing (doc-masked,
+position_ids)" — the data-side half of the distributed milestone. Section 2.4
+fixes the contract these helpers implement: packing is PER-DOCUMENT with the
+loss-mask triple (Y/Yc/G) carried through — never a naive concat.
 
-  pack_sequences()      greedy concatenation of short docs into bins of at
-                        most max_len tokens. Doc boundaries are tracked as
-                        (start, end) spans + a per-position doc index, so
-                        unpack_outputs() restores the originals EXACTLY and
-                        position ids can restart at every doc start (IR
-                        compatibility: the register addresses raw token ids,
-                        never absolute offsets — a future RoPE-WR variant
-                        must see document-local positions too).
-  doc_masked_padding()  ONE doc per row, right-padded with EOS + attention
-                        mask. Right padding is the parity-safe form for this
-                        architecture: every consumer is causal (chunked SSM
-                        scan in hmn/v2.py, triu-masked register in
-                        hmn/v3.py, teacher-forced CE), so a pad token
-                        strictly RIGHT of a document can never enter any
-                        consumed activation. Packed-batch rows are therefore
-                        numerically identical to the individual forwards —
-                        the property the M5 loss/gradient-parity gate pins.
-  unpack_outputs()      split model outputs back to per-doc lengths: batched
-                        (B, T, ...) tensors are cut at each row's length;
-                        flat 1-D packed streams are cut at cumulative lens.
+Guarantees (all verified in experiments/v6/m5_packed_sequence.py):
 
-No HMN3 changes: pure data-shape utilities; the model keeps its
-(input_ids) contract. The FSDP2/DeepSpeed wrap consumes them at the trainer
-layer; experiments/v6/m5_packed_sequence.py verifies the roadmap's explicit
-precondition FIRST — ReversibleFunction autograd compat with packed batches.
+  * pack_sequences -> doc_masked_padding -> unpack_outputs round-trips
+    EXACTLY: unpack(pack(docs)) == docs, token for token.
+  * position_ids restart at every document boundary (0-based inside each
+    doc, 0 on padding). The Identity Register is content-addressed (raw-id
+    self-match) and imposes no positional scheme of its own, but every
+    position-consuming consumer (RoPE on the roadmap-2.2 attention-WR
+    variant, HF `position_ids` inputs) must not see doc k+1 continuing
+    doc k's position clock.
+  * Padding is EOS with an explicit attention mask (1 real / 0 pad) and a
+    doc_id map, so padded positions drop out of every loss/decode consumer
+    through the standard -100/-1 target masks.
+
+Honest boundary: these utilities move DOCUMENTS and MASKS; they do not
+change model math. The production WR is a causal SSM recurrence and the IR
+binds the FIRST <|assistant|> column of the row it sees, so forwarding a
+packed row lets doc k>1 read doc<k SSM state and share token-twin groups
+across documents. Exact per-document isolation therefore needs doc-aware
+masking / state resets at the MODEL level (the FSDP2/DeepSpeed wrap half of
+M5). The M5 experiment proves the EXACT case (architecturally isolated
+documents: packed loss == sum of per-document losses, packed grads == their
+summed grads), measures — rather than hides — the residual cross-doc effect
+of the recurrent WR on later documents, and shows earlier documents are
+causally untouched.
 """
-
-from collections import namedtuple
-
 import torch
 
-PackedBin = namedtuple("PackedBin",
-                       ["ids", "lens", "spans", "doc_index", "position_ids"])
-PaddedDocs = namedtuple("PaddedDocs",
-                        ["ids", "attn_mask", "position_ids", "lens"])
 
-DOC_NONE = -100  # doc_index value for separator slots (repo sentinel)
+def pack_sequences(sequences):
+    """Concatenate short documents into ONE sequence, tracking boundaries.
 
+    sequences : list of token-id lists (or 1-D LongTensors). Documents are
+    expected to carry their own terminator (the chat recipe ends every gold
+    with EOS); no separator is injected — boundaries are tracked by LENGTH,
+    which is what keeps the round-trip exact.
 
-def _as_long_tensor(doc):
-    if torch.is_tensor(doc):
-        return doc.detach().to(torch.long).cpu()
-    return torch.tensor(list(doc), dtype=torch.long)
-
-
-def pack_sequences(docs, max_len=None, sep_id=None):
-    """Greedily concatenate short docs into bins of <= max_len tokens.
-
-    docs    : iterable of int sequences / 1-D LongTensors. Non-empty (chat
-              docs already end with their own </s>, so no separator is
-              needed by default).
-    max_len : bin capacity in tokens; None -> everything in one bin. A doc
-              longer than max_len gets its OWN oversized bin — never split,
-              because splitting would corrupt the answer-region masks.
-    sep_id  : optional separator id inserted BETWEEN consecutive docs inside
-              a bin (counted toward max_len). Separators belong to no doc:
-              doc_index marks them DOC_NONE and they trail the preceding
-              doc's position counter.
-
-    Returns [PackedBin(ids, lens, spans, doc_index, position_ids), ...] in
-    input order. Round trip is exact:
-        unpack_outputs(b.ids, b.lens) == original docs   for every bin b.
+    Returns (packed_ids list[int], doc_lens list[int]) with
+    sum(doc_lens) == len(packed_ids).
     """
-    bins = []
-    pieces, spans, lens, size = [], [], [], 0
-
-    def _close():
-        nonlocal pieces, spans, lens, size
-        if not pieces:
-            return
-        ids = torch.cat(pieces)
-        L = int(ids.numel())
-        pos = torch.zeros(L, dtype=torch.long)
-        idx = torch.full((L,), DOC_NONE, dtype=torch.long)
-        prev_end = 0
-        for k, (s, e) in enumerate(spans):
-            pos[prev_end:s] = torch.arange(prev_end, s)  # separators trail
-            pos[s:e] = torch.arange(e - s)               # per-doc reset
-            idx[s:e] = k
-            prev_end = e
-        bins.append(PackedBin(ids=ids,
-                              lens=torch.tensor(lens, dtype=torch.long),
-                              spans=list(spans), doc_index=idx,
-                              position_ids=pos))
-        pieces, spans, lens, size = [], [], [], 0
-
-    for doc in docs:
-        d = _as_long_tensor(doc)
-        n = int(d.numel())
-        if n == 0:
-            raise ValueError("empty documents break span bookkeeping")
-        sep_here = 1 if (sep_id is not None and pieces) else 0
-        if max_len is not None and pieces and size + sep_here + n > max_len:
-            _close()
-            sep_here = 0                      # new bin starts without a sep
-        if sep_here:
-            pieces.append(torch.tensor([sep_id], dtype=torch.long))
-            size += 1
-        spans.append((size, size + n))
-        lens.append(n)
-        pieces.append(d)
-        size += n
-    _close()
-    return bins
+    if not sequences:
+        raise ValueError("pack_sequences: need at least one document")
+    packed, lens = [], []
+    for d in sequences:
+        if isinstance(d, torch.Tensor):
+            d = d.tolist()
+        d = [int(t) for t in d]
+        if not d:
+            raise ValueError("pack_sequences: empty document")
+        packed.extend(d)
+        lens.append(len(d))
+    return packed, lens
 
 
-def doc_position_ids(lens):
-    """Per-document position ids for a flat concatenation of doc `lens`:
-    counters restart at 0 at every doc boundary (packed-concat form)."""
-    lens = [int(l) for l in lens]
-    return (torch.cat([torch.arange(l, dtype=torch.long) for l in lens])
-            if lens else torch.zeros(0, dtype=torch.long))
+def doc_masked_padding(packed_ids, doc_lens, max_len, pad_id, device=None):
+    """Pad a packed row to max_len with EOS + per-document attention mask.
 
-
-def doc_masked_padding(docs, max_len, pad_id):
-    """Right-pad one doc per row to max_len with pad_id (EOS in practice).
-
-    Returns PaddedDocs(ids (B,L), attn_mask (B,L long, 1=real / 0=pad),
-    position_ids (B,L), lens (B,)). One doc per row means the position ids
-    ARE the per-document counters already (each row restarts at 0); the
-    cross-boundary reset matters only in the concatenated form.
-
-    The Y/Yc/G loss triple travels through the SAME padding: pad Y/Yc with
-    -100 and G with -1.0 so every loss_v33 mask ignores pad rows by
-    construction (packing carries the masks through, never drops them).
+    Returns a dict:
+      input_ids      (1, L) long   — packed tokens then pad_id fill
+      attention_mask (1, L) long   — 1 on real document tokens, 0 on padding
+                                     ("doc-masked": mask edges ARE doc edges)
+      doc_id         (1, L) long   — index of the owning document per column,
+                                     -1 on padding
     """
-    tens = [_as_long_tensor(d) for d in docs]
-    B = len(tens)
-    longest = max(int(d.numel()) for d in tens)
-    if max_len < longest:
-        raise ValueError(f"max_len={max_len} < longest doc={longest}")
-    ids = torch.full((B, max_len), int(pad_id), dtype=torch.long)
-    attn = torch.zeros(B, max_len, dtype=torch.long)
-    for b, d in enumerate(tens):
-        n = int(d.numel())
-        ids[b, :n] = d
-        attn[b, :n] = 1
-    pos = torch.arange(max_len, dtype=torch.long).unsqueeze(0) \
-        .expand(B, -1).contiguous()
-    return PaddedDocs(ids=ids, attn_mask=attn, position_ids=pos,
-                      lens=torch.tensor([int(d.numel()) for d in tens],
-                                        dtype=torch.long))
+    L = len(packed_ids)
+    if max_len < L:
+        raise ValueError(f"doc_masked_padding: max_len {max_len} < packed "
+                         f"length {L}")
+    ids = torch.full((1, max_len), int(pad_id), dtype=torch.long, device=device)
+    am = torch.zeros((1, max_len), dtype=torch.long, device=device)
+    did = torch.full((1, max_len), -1, dtype=torch.long, device=device)
+    ids[0, :L] = torch.tensor(packed_ids, dtype=torch.long, device=device)
+    am[0, :L] = 1
+    col = 0
+    for k, ln in enumerate(doc_lens):
+        did[0, col:col + ln] = k
+        col += ln
+    return {"input_ids": ids, "attention_mask": am, "doc_id": did}
 
 
-def unpack_outputs(tensor, lens):
+def doc_position_ids(doc_lens, total_len, device=None):
+    """Per-document position_ids: restart at 0 at EVERY doc boundary.
+
+    Returns (1, total_len) long. Doc k occupies columns off_k..off_k+len_k-1
+    and receives positions 0..len_k-1; padding columns get 0 (they are
+    attention-masked out everywhere the ids are consumed).
+    """
+    pos = torch.zeros((1, total_len), dtype=torch.long, device=device)
+    col = 0
+    for ln in doc_lens:
+        if col + ln > total_len:
+            raise ValueError("doc_position_ids: doc_lens exceed total_len")
+        pos[0, col:col + ln] = torch.arange(ln, device=device)
+        col += ln
+    return pos
+
+
+def unpack_outputs(outputs, doc_lens):
     """Split model outputs back to per-doc lengths.
 
-    Batched (B, T, ...) input: [tensor[b, :lens[b]]] — the inverse of
-    doc_masked_padding (pad suffixes dropped).
-    Flat 1-D input: one concatenated packed stream cut at cumulative lens —
-    the inverse of pack_sequences (spans/separators outside doc content are
-    ignored, so the round trip is exact).
+    outputs : a Tensor with batch dim 1 (sliced along dim 1), or a dict as
+              returned by HMN3.forward — every TENSOR value is sliced along
+              dim 1; non-tensor entries (e.g. the packed IRStats object,
+              which indexes the whole row) are carried through unchanged —
+              evaluate per-document copy probabilities against it by
+              row-masking prob_at's targets, as the M5 experiment does.
+
+    Returns a list with one entry per document: the tensor slice, or a dict
+    of that document's slices.
     """
-    lens = [int(l) for l in lens]
-    if tensor.dim() == 1:
-        out, off = [], 0
-        for l in lens:
-            out.append(tensor[off:off + l])
-            off += l
-        if off != int(tensor.numel()):
-            raise ValueError(f"lens sum {off} != stream length "
-                             f"{tensor.numel()}")
+    offs = [0]
+    for ln in doc_lens:
+        offs.append(offs[-1] + ln)
+
+    def _slice(x, lo, hi):
+        if isinstance(x, torch.Tensor):
+            if x.dim() < 2 or x.shape[0] != 1:
+                raise ValueError("unpack_outputs: expected leading shape "
+                                 f"(1, L, ...) got {tuple(x.shape)}")
+            return x[:, lo:hi]
+        return x
+
+    if isinstance(outputs, torch.Tensor):
+        return [outputs[:, offs[k]:offs[k + 1]] for k in range(len(doc_lens))]
+    if isinstance(outputs, dict):
+        out = []
+        for k in range(len(doc_lens)):
+            lo, hi = offs[k], offs[k + 1]
+            out.append({key: _slice(v, lo, hi) for key, v in outputs.items()})
         return out
-    if tensor.shape[0] != len(lens):
-        raise ValueError(f"batch {tensor.shape[0]} != len(lens) {len(lens)}")
-    return [tensor[b, :l] for b, l in enumerate(lens)]
+    raise TypeError("unpack_outputs: expected Tensor or dict")
+
+
+def pack_batch(sequences, max_len, pad_id, device=None):
+    """One-call trainer entry: pack -> pad -> positions.
+
+    Returns the doc_masked_padding dict plus "position_ids" (per-doc reset)
+    and "doc_lens". Feed input_ids/position_ids to the model; carry
+    attention_mask/doc_id so targets can be placed per document and padding
+    masked out of every loss term.
+    """
+    packed, lens = pack_sequences(sequences)
+    batch = doc_masked_padding(packed, lens, max_len, pad_id, device=device)
+    batch["position_ids"] = doc_position_ids(lens, max_len, device=device)
+    batch["doc_lens"] = lens
+    return batch
