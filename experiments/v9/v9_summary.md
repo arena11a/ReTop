@@ -35,18 +35,24 @@
 - Curriculum: 0.000 unseen verb
 - **Conclusion**: Multi-task/curriculum does NOT help — ptr3 is fundamental
 
-## v9.6: Perm Generalization — Neural Seeder ✓
-- Improved SeedPointer with positional encoding
-- Tested on unseen verb families
-- **Finding**: Positional encoding helps slightly but not enough
+## v9.6: Perm Generalization — Structural Seed Pointer ✓
+- StructuralSeedPointer with positional encoding: 0.000 unseen verb
+- **Conclusion**: Positional encoding does NOT help — ptr3 plateau is fundamental
+
+## v9.7: Production ✓
+- ONNX export: BLOCKED by IR data-dependent branching (same as torch.compile)
+- Docker container: Dockerfile with health check
+- API endpoint: FastAPI with /generate, /health
+- **Finding**: IR needs refactoring for ONNX compatibility (v10+ task)
 
 ## Key Insights
 
 1. **The ptr3 plateau is a TRAINING SIGNAL problem**, not capacity/data
 2. **Bigger models make it worse** — more capacity = more overfitting to tokens
-3. **Multi-family training doesn't help** — model still memorizes verb-specific patterns
+3. **Multi-family/curriculum training doesn't help** — model still memorizes verb-specific patterns
 4. **All decoding strategies fail** on unseen verbs — they depend on token-level patterns
 5. **SSM is better than attention** for ReTop's task profile (25-46% fewer params)
+6. **IR data-dependent branching** blocks ONNX export and torch.compile (v10 refactoring needed)
 
 ## Fundamental Issue
 
@@ -72,3 +78,7 @@ These are completely different token patterns. The model cannot learn that "fetc
 - `experiments/v9/v9_3_benchmark.py` — torch.compile benchmark
 - `experiments/v9/v9_4_head_to_head.py` — attention vs SSM comparison
 - `experiments/v9/v9_5_ptr3_breakout.py` — multi-task + curriculum experiment
+- `experiments/v9/v9_6_structural_pointer.py` — structural pointer experiment
+- `hmn/export_onnx.py` — ONNX export (BLOCKED by IR data-dependent branching)
+- `hmn/api.py` — FastAPI endpoint
+- `Dockerfile` — Docker container

@@ -197,6 +197,16 @@ Roadmap: [`docs/v7_roadmap.md`](docs/v7_roadmap.md).
 - Curriculum: 0.000 unseen verb
 - **Conclusion**: ptr3 plateau is fundamental — requires architectural change
 
+**v9.6 ✅ (Perm Generalization)**: structural seed pointer:
+- StructuralSeedPointer with positional encoding: 0.000 unseen verb
+- **Conclusion**: Positional encoding does NOT help
+
+**v9.7 ✅ (Production)**: deployment infrastructure:
+- ONNX export: BLOCKED by IR data-dependent branching
+- Docker container with health check
+- FastAPI endpoint (/generate, /health)
+- **Finding**: IR needs refactoring for ONNX (v10+ task)
+
 **Key finding**: The ptr3 plateau is a training signal problem, not capacity/data. The model memorizes verb-specific token patterns instead of learning abstract swap structure. Custom tokenizer with verb-class tokens needed for v10+.
 
 ---
