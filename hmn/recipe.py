@@ -270,14 +270,23 @@ def make_reorder_ids(tok, a_s, b_s):
     (decodes to "deploy {b} and fetch {a}" after strip; every row copyable).
     Returns (ids, asi_pos, i_u).
     """
+    return make_reorder_ids_v2(tok, a_s, b_s, "fetch", "deploy")
+
+
+def make_reorder_ids_v2(tok, a_s, b_s, verb_a="fetch", verb_b="deploy"):
+    """Build teacher-forced reorder ids with arbitrary verb pair.
+
+    Same contract as make_reorder_ids but supports any verb pair.
+    Returns (ids, asi_pos, i_u).
+    """
     bos = tok.token_to_id(BOS)
     uid = tok.token_to_id(USER)
     asid = tok.token_to_id(ASSIST)
     eos = tok.token_to_id(EOS)
-    U = list(tok.encode(f"fetch {a_s} and deploy {b_s}").ids)
+    U = list(tok.encode(f"{verb_a} {a_s} and {verb_b} {b_s}").ids)
     i_u = _find_word(tok, U, REORDER_AND)
     if i_u <= 0:
-        raise AssertionError("make_reorder_ids: 'and' not found as a single token")
+        raise AssertionError("make_reorder_ids_v2: 'and' not found as a single token")
     Gt = U[i_u + 1:] + [U[i_u]] + U[:i_u]
     ids = [bos, uid] + U + [asid] + Gt + [eos]
     return ids, 2 + len(U), i_u
@@ -440,6 +449,56 @@ def make_reorder_batch(tok, a_slots, b_slots, bs, seed, device=None):
         a_s = rng.choice(a_slots)
         b_s = rng.choice(b_slots)
         ids, asi_pos, _ = make_reorder_ids(tok, a_s, b_s)
+        anchors, seams, runs = reorder_anchors(ids, asid, tok)
+        targets = ids[1:] + [eos]
+        Tn = len(ids)
+        y, yc, gt = [-100] * Tn, [-100] * Tn, [-1.0] * Tn
+        for t in range(asi_pos, Tn):
+            tgt = targets[t]
+            y[t] = tgt
+            if tgt == eos:
+                yc[t] = -100
+                gt[t] = 0.0
+            else:
+                yc[t] = tgt
+                gt[t] = 1.0
+        X.append(ids); Y.append(y); YC.append(yc); G.append(gt)
+        AN.append(anchors); S.append(seams); R.append(runs)
+    dev = resolve_device(device)
+    T = max(len(x) for x in X)
+    Xb = torch.full((bs, T), eos, dtype=torch.long, device=dev)
+    Yb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    YcB = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Gb = torch.full((bs, T), -1.0, dtype=torch.float, device=dev)
+    Ab = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    Sb = torch.zeros((bs, T), dtype=torch.bool, device=dev)
+    Rb = torch.full((bs, T), -100, dtype=torch.long, device=dev)
+    for j in range(bs):
+        L = len(X[j])
+        Xb[j, :L] = torch.tensor(X[j], device=dev)
+        Yb[j, :L] = torch.tensor(Y[j], device=dev)
+        YcB[j, :L] = torch.tensor(YC[j], device=dev)
+        Gb[j, :L] = torch.tensor(G[j], device=dev)
+        Ab[j, :L] = torch.tensor(AN[j], device=dev)
+        Sb[j, :L] = torch.tensor(S[j], device=dev)
+        Rb[j, :L] = torch.tensor(R[j], device=dev)
+    return Xb, Yb, YcB, Gb, Ab, Sb, Rb
+
+
+def make_reorder_batch_v2(tok, a_slots, b_slots, bs, seed,
+                           verb_a="fetch", verb_b="deploy", device=None):
+    """v9.3: Multi-family reorder batch with arbitrary verb pair.
+
+    Same contract as make_reorder_batch but supports any verb pair.
+    """
+    rng = random.Random(seed)
+    eos = tok.token_to_id(EOS)
+    asid = tok.token_to_id(ASSIST)
+    X, Y, YC, G, AN, S, R = [], [], [], [], [], [], []
+    for _ in range(bs):
+        a_s = rng.choice(a_slots)
+        b_s = rng.choice(b_slots)
+        ids, asi_pos, _ = make_reorder_ids_v2(tok, a_s, b_s, verb_a, verb_b)
         anchors, seams, runs = reorder_anchors(ids, asid, tok)
         targets = ids[1:] + [eos]
         Tn = len(ids)
