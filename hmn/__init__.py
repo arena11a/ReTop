@@ -92,4 +92,4 @@ __all__ = [
     "load_compat",
 ]
 
-__version__ = "0.9.4"
+__version__ = "0.9.7"
